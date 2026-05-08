@@ -601,3 +601,20 @@ def mm_out(a, b, *, out):
     if cluster_remote_mm_scenario(a, b, out, M, N, K):
         return cluster_remote_mm(a, b, out, M, N, K)
     return general_mm(a, b, out, M, N, K)
+
+
+def mm_no_tma(a, b):
+    device = a.device
+    # handle non-contiguous inputs if necessary
+    if a.stride(0) > 1 and a.stride(1) > 1:
+        a = a.contiguous()
+    if b.stride(0) > 1 and b.stride(1) > 1:
+        b = b.contiguous()
+    # checks constraints
+    assert a.shape[1] == b.shape[0], "incompatible dimensions"
+    M, K = a.shape
+    _, N = b.shape
+    # allocates output
+    c_dtype = get_higher_dtype(a.dtype, b.dtype)
+    c = torch.empty((M, N), device=device, dtype=c_dtype)
+    return general_mm(a, b, c, M, N, K)

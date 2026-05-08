@@ -893,3 +893,200 @@ def mm_out(a, b, *, out):
         if cluster_remote_mm_scenario(a, b, out, M, N, K):
             return cluster_remote_mm(a, b, out, M, N, K)
     return general_mm(a, b, out, M, N, K)
+
+
+def mm_host_tma(a, b):
+    device = a.device
+    # handle non-contiguous inputs if necessary
+    if a.stride(0) > 1 and a.stride(1) > 1:
+        a = a.contiguous()
+    if b.stride(0) > 1 and b.stride(1) > 1:
+        b = b.contiguous()
+    # checks constraints
+    assert a.shape[1] == b.shape[0], "incompatible dimensions"
+    M, K = a.shape
+    _, N = b.shape
+    # allocates output
+    c_dtype = get_higher_dtype(a.dtype, b.dtype)
+    c = torch.empty((M, N), device=device, dtype=c_dtype)
+
+    # Broadcast tensors from expand() have stride=0, incompatible with TMA
+    if 0 in a.stride():
+        a = a.contiguous()
+    if 0 in b.stride():
+        b = b.contiguous()
+
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+    a_row_major = a.stride(1) == 1
+    b_row_major = b.stride(1) == 1
+    dummy_block = [1, 1]
+    # triton 3.5.0
+    from triton.tools.tensor_descriptor import TensorDescriptor
+
+    if a_row_major:
+        a_desc = TensorDescriptor(a, a.shape, a.stride(), dummy_block)
+    else:
+        a_desc = TensorDescriptor(a, a.T.shape, a.T.stride(), dummy_block)
+    if b_row_major:
+        b_desc = TensorDescriptor(b, b.shape, b.stride(), dummy_block)
+    else:
+        b_desc = TensorDescriptor(b, b.T.shape, b.T.stride(), dummy_block)
+    c_desc = TensorDescriptor(c, c.shape, c.stride(), dummy_block)
+
+    input_dtype = a.dtype
+    dtype_str = str(input_dtype).split(".")[-1]
+
+    with torch_device_fn.device(a.device):
+        mm_kernel_general_host_tma[grid](
+            a_desc,
+            b_desc,
+            c_desc,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            GROUP_M=8,
+            A_ROW_MAJOR=a_row_major,
+            B_ROW_MAJOR=b_row_major,
+            dtype=dtype_str,
+        )
+    return c
+
+
+@libentry()
+@libtuner(
+    configs=runtime.get_tuned_config("mm"),
+    # Add 'stride_am' and 'stride_bk' to trigger autotune for tensors with the same shape but different strides.
+    key=["M", "N", "K", "stride_am", "stride_bk"],
+    strategy=["default", "default", "default", "default", "default"],
+    warmup=5,
+    rep=10,
+)
+@triton.jit
+def mm_kernel_general_device_tma(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    IS_FP64: tl.constexpr = False,
+):
+    # matrix multiplication
+    pid = ext.program_id(0)
+    grid_m = tl.cdiv(M, BLOCK_M)
+    grid_n = tl.cdiv(N, BLOCK_N)
+    # re-order program ID for better L2 performance
+    width = GROUP_M * grid_n
+    group_id = pid // width
+    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
+    pid_m = group_id * GROUP_M + (pid % group_size)
+    pid_n = (pid % width) // (group_size)
+
+    # offset
+    offset_am = pid_m * BLOCK_M
+    offset_bn = pid_n * BLOCK_N
+    offset_k = 0
+
+    a_desc = tl.make_tensor_descriptor(
+        base=A,
+        shape=[M, K],
+        strides=[K, 1],
+        block_shape=[BLOCK_M, BLOCK_K],
+    )
+
+    # row-major
+    b_desc = tl.make_tensor_descriptor(
+        base=B,
+        shape=[K, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_K, BLOCK_N],
+    )
+
+    c_desc = tl.make_tensor_descriptor(
+        base=C,
+        shape=[M, N],
+        strides=[N, 1],
+        block_shape=[BLOCK_M, BLOCK_N],
+    )
+
+    if IS_FP64:
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float64)
+    else:
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        a = a_desc.load([offset_am.to(tl.int32), offset_k.to(tl.int32)])
+        b = b_desc.load([offset_k.to(tl.int32), offset_bn.to(tl.int32)])
+        if IS_FP64:
+            acc += tl.dot(a, b, allow_tf32=False)
+        else:
+            acc += tl.dot(a, b, out_dtype=tl.float32, allow_tf32=False)
+        offset_k += BLOCK_K
+
+    acc = acc.to(a_desc.dtype)
+    c_desc.store([offset_am.to(tl.int32), offset_bn.to(tl.int32)], acc)
+
+
+def mm_device_tma(a, b):
+    device = a.device
+    # handle non-contiguous inputs if necessary
+    if a.stride(0) > 1 and a.stride(1) > 1:
+        a = a.contiguous()
+    if b.stride(0) > 1 and b.stride(1) > 1:
+        b = b.contiguous()
+    # checks constraints
+    assert a.shape[1] == b.shape[0], "incompatible dimensions"
+    M, K = a.shape
+    _, N = b.shape
+    # allocates output
+    c_dtype = get_higher_dtype(a.dtype, b.dtype)
+    c = torch.empty((M, N), device=device, dtype=c_dtype)
+
+    # Broadcast tensors from expand() have stride=0, incompatible with TMA
+    if 0 in a.stride():
+        a = a.contiguous()
+    if 0 in b.stride():
+        b = b.contiguous()
+    grid = lambda META: (
+        triton.cdiv(M, META["BLOCK_M"]) * triton.cdiv(N, META["BLOCK_N"]),
+    )
+    def alloc_fn(size: int, align: int, stream: Optional[int]):
+        return torch.empty(size, dtype=torch.int8, device=a.device)
+
+    triton.set_allocator(alloc_fn)
+
+    with torch_device_fn.device(a.device):
+        mm_kernel_general_device_tma[grid](
+            a,
+            b,
+            c,
+            M,
+            N,
+            K,
+            a.stride(0),
+            a.stride(1),
+            b.stride(0),
+            b.stride(1),
+            c.stride(0),
+            c.stride(1),
+            GROUP_M=8,
+            IS_FP64=a.dtype == torch.float64,
+        )
+    return c
