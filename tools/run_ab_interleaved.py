@@ -12,7 +12,10 @@ NPUs.
 
 Every compilation is forced fresh (TRITON_ALWAYS_COMPILE=1) and dumped into a
 per-config, per-run cache (TRITON_CACHE_DIR); nothing is pruned. TTIR is
-<out>/<config>/cache/<hash>/<kernel>.ttir (plus the other stages).
+<out>/<config>/cache/<hash>/<kernel>.ttir (plus the other stages). Dumps are
+printed in MLIR generic op form by default via TRITON_MLIR_PRINT_OP_GENERIC=1
+(equivalent to --mlir-print-op-generic); pass --no-generic-ir to keep the
+custom printer.
 
 Benchmarks use ``--metrics latency`` only, so the torch/native baseline is
 never timed (no latency_base / speedup / tflops / gbps). Accuracy keeps
@@ -107,6 +110,7 @@ PASS_ENV_NAMES = [
     "TRITON_LANE_VECTORIZE_ALLOW_CONCAT",
     "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES",
     "TRITON_LANE_VECTORIZE_ALLOW_FP_CROSS_LANE",
+    "TRITON_MLIR_PRINT_OP_GENERIC",
 ]
 
 
@@ -145,7 +149,7 @@ def device_vars() -> list[str]:
 
 
 def build_env(npu: int, config: str, cache_dir: Path,
-              device_var_names: list[str]) -> dict:
+              device_var_names: list[str], generic_ir: bool = True) -> dict:
     env = os.environ.copy()
     for var in device_var_names:
         env[var] = str(npu)
@@ -156,6 +160,9 @@ def build_env(npu: int, config: str, cache_dir: Path,
     # Force a fresh compilation and keep every dumped stage in this run's cache.
     env["TRITON_ALWAYS_COMPILE"] = "1"
     env["TRITON_CACHE_DIR"] = str(cache_dir)
+    # Print dumped stage IR (including .ttir) in MLIR generic op form, i.e.
+    # --mlir-print-op-generic, for canonical/diffable dumps.
+    env["TRITON_MLIR_PRINT_OP_GENERIC"] = "1" if generic_ir else "0"
     return env
 
 
@@ -233,7 +240,8 @@ def run_accuracy_once(op, marker, config, npu, work: dict, attempt: int):
         raw.unlink()
     so = op_dir / f"accuracy_{config}_a{attempt}.stdout.log"
     se = op_dir / f"accuracy_{config}_a{attempt}.stderr.log"
-    env = build_env(npu, config, work["cache_dir"], work["device_vars"])
+    env = build_env(npu, config, work["cache_dir"], work["device_vars"],
+                    work["generic_ir"])
     cmd = accuracy_cmd(marker, raw, work["ref_cpu"], work["quick"])
     rc = run_cmd(cmd, ROOT / "tests", env, work["timeout"], so, se)
     return rc, read_json(raw), raw
@@ -247,7 +255,8 @@ def run_accuracy_cases(op, config, npu, work: dict, node_ids: list[str], attempt
         raw.unlink()
     so = op_dir / f"accuracy_{config}_retry{attempt}.stdout.log"
     se = op_dir / f"accuracy_{config}_retry{attempt}.stderr.log"
-    env = build_env(npu, config, work["cache_dir"], work["device_vars"])
+    env = build_env(npu, config, work["cache_dir"], work["device_vars"],
+                    work["generic_ir"])
     rel = [strip_tests_prefix(k) for k in node_ids]
     cmd = ["pytest", *rel, "--record", "json", "--output", str(raw)]
     if work["ref_cpu"]:
@@ -339,7 +348,8 @@ def run_benchmark_once(op, marker, config, npu, work: dict, attempt: int):
         raw.unlink()
     so = op_dir / f"performance_{config}_a{attempt}.stdout.log"
     se = op_dir / f"performance_{config}_a{attempt}.stderr.log"
-    env = build_env(npu, config, work["cache_dir"], work["device_vars"])
+    env = build_env(npu, config, work["cache_dir"], work["device_vars"],
+                    work["generic_ir"])
     cmd = benchmark_cmd(marker, raw, work["level"], work["metrics"])
     rc = run_cmd(cmd, ROOT / "benchmark", env, work["timeout"], so, se)
     return rc, read_json(raw)
@@ -391,6 +401,7 @@ def process_op(op: str, marker: str, order: list[str], npu: int,
             "level": worker_cfg["level"],
             "metrics": worker_cfg["metrics"],
             "device_vars": worker_cfg["device_vars"],
+            "generic_ir": worker_cfg["generic_ir"],
         }
         acc = process_accuracy(op, marker, config, npu, work, log_retry)
         with (work["results_dir"] / op / "accuracy_result.json").open("w") as fh:
@@ -456,6 +467,12 @@ def parse_args(argv=None):
                    help=argparse.SUPPRESS)  # deprecated: max_runs = max_retries + 1
     p.add_argument("--retry-skipped", action="store_true",
                    help="also retry 'skipped' cases (off by default)")
+    p.add_argument("--generic-ir", dest="generic_ir", action="store_true",
+                   default=True,
+                   help="dump stage IR in MLIR generic op form "
+                        "(TRITON_MLIR_PRINT_OP_GENERIC=1; default on)")
+    p.add_argument("--no-generic-ir", dest="generic_ir", action="store_false",
+                   help="use the default (custom) MLIR printer for dumps")
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
                    help="per pytest invocation timeout (s)")
     p.add_argument("--no-compare", action="store_true",
@@ -512,6 +529,7 @@ def main(argv=None) -> int:
         "accuracy": {"ref": args.ref, "quick": args.quick},
         "max_runs": args.max_runs,
         "retry_skipped": args.retry_skipped,
+        "generic_ir": args.generic_ir,
     }
     with (out_root / "manifest.json").open("w") as fh:
         json.dump(manifest, fh, indent=2, default=str)
@@ -526,7 +544,8 @@ def main(argv=None) -> int:
     print(f"[ab] ops={len(ops)}  npus={npus}  output={out_root}")
     print(f"[ab] OFF={CONFIGS['off']}  ON={CONFIGS['on']}")
     print(f"[ab] benchmark level={args.level} metrics={args.metrics}  "
-          f"accuracy ref={args.ref}  max_runs={args.max_runs}")
+          f"accuracy ref={args.ref}  max_runs={args.max_runs}  "
+          f"generic_ir={args.generic_ir}")
 
     if args.dry_run:
         for op, marker, order in plan[:20]:
@@ -545,6 +564,7 @@ def main(argv=None) -> int:
         "metrics": None if args.metrics.lower() == "none" else args.metrics,
         "skip_cpu": skip_cpu,
         "device_vars": device_vars(),
+        "generic_ir": args.generic_ir,
     }
 
     work_q = mp.Queue()
