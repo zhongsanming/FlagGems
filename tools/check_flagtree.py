@@ -112,9 +112,11 @@ try:
             fh.write("module {}\n")
         mod = ir.parse_mlir_module(tmp, ctx)
         op = getattr(mod, "operation", mod)
-        generic = op.get_asm(print_generic_op_form=True)
+        generic = op.get_asm(print_generic_op_form=True,
+                             print_debug_info=False)
         show("  print_generic_op_form works",
              generic.lstrip().startswith('"builtin.module"'))
+        show("  locations stripped", "loc(" not in generic)
         print("    head:", generic[:90].replace("\n", " "))
     finally:
         os.unlink(tmp)
