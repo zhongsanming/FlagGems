@@ -111,7 +111,8 @@ try:
         with os.fdopen(fd, "w") as fh:
             fh.write("module {}\n")
         mod = ir.parse_mlir_module(tmp, ctx)
-        generic = mod.operation.get_asm(print_generic_op_form=True)
+        op = getattr(mod, "operation", mod)
+        generic = op.get_asm(print_generic_op_form=True)
         show("  print_generic_op_form works",
              generic.lstrip().startswith('"builtin.module"'))
         print("    head:", generic[:90].replace("\n", " "))
