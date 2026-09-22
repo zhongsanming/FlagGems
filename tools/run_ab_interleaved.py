@@ -26,14 +26,20 @@ test harness).
 
 Retries
 -------
-Every test case whose result is not ``passed`` (or ``skipped``, which is
-deterministic and not retried unless --retry-skipped is given) is a failure.
-The first run records which cases failed; each failing case is then retried
-individually until it has run at most --max-runs times total (default 5,
-including the first run) on the same NPU/config. A benchmark run that crashes
-or reports a failed operator is retried whole, also capped at --max-runs total.
-Every failed attempt is appended to <out>/retries.<npu>.jsonl, even when a
-later attempt succeeds, and a <out>/retry_summary.json is written at the end.
+Whole-op retries happen only on infrastructure failure (a missing or invalid
+result JSON), up to --max-runs total. Case-level accuracy failures are recorded
+as-is by default; pass --retry-cases to retry them individually (also capped at
+--max-runs). Benchmark case-level errors are never retried whole. Retrying
+pre-existing failures is off by default: it wasted hours for almost no recovery
+and the extra load perturbed concurrent benchmarks. Every failed attempt is
+appended to <out>/retries.<npu>.jsonl, and <out>/retry_summary.json is written
+at the end.
+
+Stages
+------
+--stage {both,accuracy,benchmark} (default both) runs only the selected stage and
+keeps the other stage's existing results, so benchmarks can be redone without
+re-running accuracy (and vice versa).
 
 At the end ``tools/compare_results.py`` is invoked unless --no-compare.
 
@@ -149,16 +155,22 @@ def read_json(path: Path):
         return None
 
 
-def op_finished(out_root: Path, configs: list[str], op: str) -> bool:
-    """Whether an op already has complete results for every config.
+_RESULT_FILES = {
+    "accuracy": "accuracy_result.json",
+    "benchmark": "performance_result.json",
+}
 
-    An op is finished when every config has a valid ``accuracy_result.json`` and
-    ``performance_result.json``. A truncated file (e.g. from a disk-full kill)
-    does not parse and therefore counts as unfinished.
+
+def op_finished(out_root: Path, configs: list[str], op: str,
+                stages=("accuracy", "benchmark")) -> bool:
+    """Whether an op already has complete results for the requested stages.
+
+    A stage is complete when every config has a valid result file. A truncated
+    file (e.g. from a disk-full kill) does not parse and counts as unfinished.
     """
     for config in configs:
-        for name in ("accuracy_result.json", "performance_result.json"):
-            path = out_root / config / "results" / op / name
+        for stage in stages:
+            path = out_root / config / "results" / op / _RESULT_FILES[stage]
             if not path.is_file() or read_json(path) is None:
                 return False
     return True
@@ -351,6 +363,12 @@ def process_accuracy(op, marker, config, npu, work: dict, log_retry) -> dict:
     if not data:
         return {}
 
+    # Per-case retries are OPT-IN (--retry-cases). By default failures are
+    # recorded as-is: retrying pre-existing failures burned hours for almost no
+    # recovery and added load that perturbed concurrent benchmarks.
+    if not work["retry_cases"]:
+        return data
+
     # Per-case retries on the same NPU/config, bounded by the remaining budget so
     # a case runs at most max_runs times in total.
     remaining_budget = max(0, work["max_runs"] - whole_attempts)
@@ -425,21 +443,24 @@ def process_benchmark(op, marker, config, npu, work: dict, log_retry) -> dict:
     data = None
     for attempt in range(1, work["max_runs"] + 1):
         rc, data = run_benchmark_once(op, marker, config, npu, work, attempt)
-        if bench_success(data):
+        # Only a missing/invalid result JSON is an infrastructure failure worth
+        # retrying. Case-level error_msg or an op-level "failed" is recorded
+        # as-is: retrying the whole op used to push OFF and ON hours apart and
+        # kept only the last (often heavily loaded) measurement.
+        if data is not None:
             if attempt > 1:
                 log_retry({
                     "op": op, "config": config, "stage": "benchmark",
                     "unit": "op", "attempt": attempt, "returncode": rc,
                     "reason": "recovered", "eventually": "passed",
                 })
-            return data or {}
+            return data
         log_retry({
             "op": op, "config": config, "stage": "benchmark",
             "unit": "op", "attempt": attempt, "returncode": rc,
-            "reason": "no_result_json" if not data else "failed_result",
-            "eventually": "failed",
+            "reason": "no_result_json", "eventually": "failed",
         })
-    return data or {}
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -469,15 +490,19 @@ def process_op(op: str, marker: str, order: list[str], npu: int,
             "metrics": worker_cfg["metrics"],
             "device_vars": worker_cfg["device_vars"],
             "generic_ir": worker_cfg["generic_ir"],
+            "retry_cases": worker_cfg["retry_cases"],
         }
         cache_dir = work["cache_dir"]
         before = set(os.listdir(cache_dir)) if cache_dir.is_dir() else set()
-        acc = process_accuracy(op, marker, config, npu, work, log_retry)
-        with (work["results_dir"] / op / "accuracy_result.json").open("w") as fh:
-            json.dump(acc, fh, indent=2, default=str)
-        perf = process_benchmark(op, marker, config, npu, work, log_retry)
-        with (work["results_dir"] / op / "performance_result.json").open("w") as fh:
-            json.dump(perf, fh, indent=2, default=str)
+        stage = worker_cfg["stage"]
+        if stage in ("both", "accuracy"):
+            acc = process_accuracy(op, marker, config, npu, work, log_retry)
+            with (work["results_dir"] / op / "accuracy_result.json").open("w") as fh:
+                json.dump(acc, fh, indent=2, default=str)
+        if stage in ("both", "benchmark"):
+            perf = process_benchmark(op, marker, config, npu, work, log_retry)
+            with (work["results_dir"] / op / "performance_result.json").open("w") as fh:
+                json.dump(perf, fh, indent=2, default=str)
         if worker_cfg["prune_stages"]:
             new = set(os.listdir(cache_dir)) - before if cache_dir.is_dir() else set()
             prune_cache_stages(cache_dir, new)
@@ -532,6 +557,12 @@ def parse_args(argv=None):
     p.add_argument("--ref", default="cpu", choices=["cpu", "device"],
                    help="accuracy reference device (default cpu)")
     p.add_argument("--quick", action="store_true", help="accuracy --quick")
+    p.add_argument("--stage", choices=["both", "accuracy", "benchmark"], default="both",
+                   help="run only this stage; the other stage's existing results "
+                        "are kept (default both)")
+    p.add_argument("--retry-cases", dest="retry_cases", action="store_true",
+                   help="retry failing accuracy cases individually (off by default; "
+                        "whole-op infrastructure retries are always on)")
     p.add_argument("--max-runs", type=int, default=5,
                    help="max total runs/attempts per failing case or op, including "
                         "the first (default 5)")
@@ -609,19 +640,21 @@ def main(argv=None) -> int:
         return 1
 
     configs = list(CONFIGS.keys())
+    stages = ("accuracy", "benchmark") if args.stage == "both" else (args.stage,)
     all_plan = []
     for i, op in enumerate(ops):
         order = ["off", "on"] if i % 2 == 0 else ["on", "off"]
         all_plan.append((op, markers[op], order))
 
-    # Resume is the default: skip ops that already have complete results.
+    # Resume is the default: skip ops that already have complete results for the
+    # requested stages.
     skipped: list = []
     if args.force:
         plan = all_plan
     else:
         plan = []
         for item in all_plan:
-            if op_finished(out_root, configs, item[0]):
+            if op_finished(out_root, configs, item[0], stages):
                 skipped.append(item[0])
             else:
                 plan.append(item)
@@ -642,6 +675,8 @@ def main(argv=None) -> int:
         "accuracy": {"ref": args.ref, "quick": args.quick},
         "max_runs": args.max_runs,
         "retry_skipped": args.retry_skipped,
+        "retry_cases": args.retry_cases,
+        "stage": args.stage,
         "generic_ir": args.generic_ir,
     }
     manifest_path = out_root / "manifest.json"
@@ -668,6 +703,7 @@ def main(argv=None) -> int:
     print(f"[ab] OFF={CONFIGS['off']}  ON={CONFIGS['on']}")
     print(f"[ab] benchmark level={args.level} metrics={args.metrics}  "
           f"accuracy ref={args.ref}  max_runs={args.max_runs}  "
+          f"stage={args.stage} retry_cases={args.retry_cases} "
           f"generic_ir={args.generic_ir}  prune_stages={args.prune_stages}")
 
     if args.dry_run:
@@ -692,6 +728,8 @@ def main(argv=None) -> int:
         "skip_cpu": skip_cpu,
         "device_vars": device_vars(),
         "generic_ir": args.generic_ir,
+        "retry_cases": args.retry_cases,
+        "stage": args.stage,
         "prune_stages": args.prune_stages,
     }
 
