@@ -22,13 +22,16 @@ os.environ["TRITON_DISABLE_LANE_VECTORIZE"] = "1"
 os.environ["TRITON_MLIR_PRINT_OP_GENERIC"] = "1"
 os.environ["TRITON_F32_DEFAULT"] = "tf32"          # upstream invalidating var, for contrast
 
-FLAGTREE_VARS = [
+# The four triton-lane-vectorize toggles. They are deliberately NOT in the JIT
+# cache key (see include/flagtree/Common/EnvVars.h), so section 1 should report
+# them absent even when set.
+PASS_VARS = [
     "TRITON_DISABLE_LANE_VECTORIZE",
     "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE",
     "TRITON_LANE_VECTORIZE_ALLOW_CONCAT",
     "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES",
-    "TRITON_MLIR_PRINT_OP_GENERIC",
 ]
+FLAGTREE_VARS = PASS_VARS + ["TRITON_MLIR_PRINT_OP_GENERIC"]
 UPSTREAM_VAR = "TRITON_F32_DEFAULT"
 
 
@@ -67,7 +70,7 @@ try:
 
     env = g()
     print("    returned:", env)
-    show("  flagtree var seen", "TRITON_DISABLE_LANE_VECTORIZE" in env)
+    show("  pass vars in cache key", any(v in env for v in PASS_VARS))
     show("  generic var seen", "TRITON_MLIR_PRINT_OP_GENERIC" in env)
     show("  upstream var seen", UPSTREAM_VAR in env)
 except Exception as exc:  # noqa: BLE001
@@ -125,8 +128,9 @@ except Exception as exc:  # noqa: BLE001
 
 print("=" * 74)
 print("Verdict hints:")
-print("  - all 3 'seen' booleans True -> rebuild is good")
-print("  - upstream var seen but flagtree var not -> libtriton.so lacks the merge")
+print("  - pass vars in cache key should be False (they are excluded by design)")
+print("  - generic var seen True -> the flagtree cache-key merge is wired up")
+print("  - upstream var seen True -> the upstream merge works")
 print("  - .so string counts 0 for flagtree vars -> building from an old tree")
 print("  - section 4 FAILED -> libtriton.so lacks print_generic_op_form")
 print("=" * 74)
