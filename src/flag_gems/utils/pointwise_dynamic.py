@@ -1384,9 +1384,31 @@ class PointwiseDynamicFunction:
 
     def _call_real_impl(self, *args, **kwargs):
         """Single entry point for real kernel invocation."""
+        # Ascend 910B backs an aliased in-place elementwise kernel
+        # (in_ptr == out_ptr) incorrectly: repeated runs on the same input
+        # leave a different subset of elements un-updated. When
+        # FLAG_GEMS_AVOID_INPLACE_ALIAS=1, route such outputs through a
+        # temporary buffer and copy back, mirroring the mul workaround.
+        aliased_outs = []
+        if os.environ.get("FLAG_GEMS_AVOID_INPLACE_ALIAS", "0") not in (
+                "0", "", "false", "False"):
+            in_ptrs = {
+                t.data_ptr() for t in args if isinstance(t, torch.Tensor)
+            }
+            for k, v in list(kwargs.items()):
+                if (k.startswith("out") and isinstance(v, torch.Tensor)
+                        and v.numel() and v.data_ptr() in in_ptrs):
+                    kwargs[k] = None
+                    aliased_outs.append((k, v))
         ndim, args, kwargs = self.prepare_args(*args, **kwargs)
         overload = self.instantiate(ndim)
         out = overload(*args, **kwargs)
+        # Copy the freshly computed results back into the aliased outputs.
+        if aliased_outs:
+            results = out if isinstance(out, (tuple, list)) else (out,)
+            for (k, dst), res in zip(aliased_outs, results):
+                if isinstance(res, torch.Tensor):
+                    dst.copy_(res)
         # Record allocated outputs so that a subsequent graph-capture run can
         # reuse the same buffers instead of calling empty_like / empty.
         if not self._is_capturing():
