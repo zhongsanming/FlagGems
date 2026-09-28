@@ -673,7 +673,17 @@ def _argmax_probe(args) -> int:
 
     # Drive the two internal kernels directly with/without an explicit sync.
     try:
-        from flag_gems.runtime.backend._ascend.ops import argmax as am
+        import importlib
+
+        am = importlib.import_module(
+            "flag_gems.runtime.backend._ascend.ops.argmax")
+        if not hasattr(am, "argmax_kernel_1"):
+            # The package __init__ re-exports `argmax` (the function), which can
+            # shadow the module. Re-fetch the real module object by full name.
+            import sys as _sys
+
+            am = _sys.modules[
+                "flag_gems.runtime.backend._ascend.ops.argmax"]
 
         import math
         import triton
