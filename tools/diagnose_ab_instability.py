@@ -25,8 +25,14 @@ Run on the NPU host, e.g.:
     python tools/diagnose_ab_instability.py --op mul_ --config both --repeat 5
     python tools/diagnose_ab_instability.py --op argmax --both-configs
     python tools/diagnose_ab_instability.py --op mul_ --repeat 10 --sync
+    python tools/diagnose_ab_instability.py --triton-probe   # backend-only
 
 Respects FLAG_GEMS_SEED (like the A/B harness). Prints a JSON verdict.
+
+The diagnostic also runs an out-of-place gem path for mul_ and reports
+`oop_deterministic` / `ALIASING_SUSPECT`: in-place is nondeterministic while
+out-of-place is stable points at an aliased load/store lowering bug. Use
+--triton-probe to confirm it with a bare triton kernel and multibuffer on/off.
 
 --sync inserts accelerator synchronizations around each gem run. If the
 instability disappears with --sync but is present without it, the cause is a
@@ -192,6 +198,26 @@ def diagnose(op: str, shape, dtype, scalar, device, repeat: int,
     out["gem_scalars"] = gem_vals
     out["kernel_deterministic"] = len(set(gem_hashes)) == 1
 
+    # ---- mul_ aliasing probe: in-place vs out-of-place ----------------------
+    # An in-place elementwise kernel aliases x_ptr == output_ptr, which some
+    # backends lower incorrectly (load/store reordering), leaving elements
+    # unmultiplied. Compare against the out-of-place gem path on the same input.
+    if op == "mul_":
+        oop_hashes = []
+        for _ in range(repeat):
+            inp = a.clone()
+            _sync()
+            with flag_gems.use_gems():
+                res = torch.mul(inp, scalar)  # out-of-place, fresh output
+            _sync()
+            oop_hashes.append(_hash_tensor(res))
+        out["oop_hashes"] = oop_hashes
+        out["oop_deterministic"] = len(set(oop_hashes)) == 1
+        if oop_hashes and last_res is not None:
+            out["inplace_matches_oop_last"] = (
+                gem_hashes[-1] == oop_hashes[-1]
+            )
+
     return out
 
 
@@ -222,7 +248,14 @@ def main(argv=None) -> int:
     ap.add_argument("--analyze-diag", metavar="GLOB",
                     help="analyze per-test fingerprint JSONL files produced with "
                          "FLAG_GEMS_AB_DIAG=1 (e.g. '<out>/*/diag/*.jsonl>')")
+    ap.add_argument("--triton-probe", action="store_true",
+                    help="minimal aliased in-place triton kernel, run with "
+                         "multibuffer on/off, to isolate an Ascend auto "
+                         "multi-buffer bug independent of FlagGems")
     args = ap.parse_args(argv)
+
+    if args.triton_probe:
+        return _triton_probe(args)
 
     if args.analyze_diag:
         return _analyze_diag(args.analyze_diag)
@@ -262,6 +295,11 @@ def main(argv=None) -> int:
         verdict.append("INPUT_NONDETERMINISM (seed not effective)")
     if not res["kernel_deterministic"]:
         verdict.append("KERNEL_NONDETERMINISM (same input -> different gem out)")
+    if res.get("oop_deterministic") is True and not res["kernel_deterministic"]:
+        verdict.append("ALIASING_SUSPECT (in-place nondeterministic but "
+                       "out-of-place gem path is stable)")
+    if res.get("oop_deterministic") is False:
+        verdict.append("OOP_ALSO_NONDETERMINISTIC")
     if res.get("n_ties_at_max", 0) > 1:
         verdict.append(f"MAX_TIE (n_ties={res['n_ties_at_max']})")
     if not verdict:
@@ -281,6 +319,22 @@ CONFIG_ENV = {
         "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES": "0",
     },
 }
+
+
+def _extract_json(text: str):
+    """Return the first JSON object in text, tolerating leading noise.
+
+    Backend warnings (e.g. "[WARNING] triton.backends.ascend.utils not found")
+    can be printed to stdout before our report, so a plain json.loads fails.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[start:])
+        return obj
+    except json.JSONDecodeError:
+        return None
 
 
 def _run_pair(label_a: str, label_b: str, args) -> int:
@@ -311,10 +365,8 @@ def _run_pair(label_a: str, label_b: str, args) -> int:
             if args.sync:
                 cmd += ["--sync"]
             proc = subprocess.run(cmd, capture_output=True, text=True)
-            try:
-                results[tag] = json.loads(proc.stdout)
-            except json.JSONDecodeError:
-                results[tag] = {"error": proc.stdout + proc.stderr}
+            results[tag] = _extract_json(proc.stdout) or {
+                "error": proc.stdout + proc.stderr}
 
     a, b = results.get("A", {}), results.get("B", {})
     if "error" in a or "error" in b:
@@ -340,10 +392,18 @@ def _run_pair(label_a: str, label_b: str, args) -> int:
     if not report["input_matches"]:
         print("VERDICT: INPUT differs across processes -> fix RNG seeding",
               file=sys.stderr)
+    elif not (report["kernel_deterministic_A"] and report["kernel_deterministic_B"]):
+        bad = [n for n, ok in (("A", report["kernel_deterministic_A"]),
+                               ("B", report["kernel_deterministic_B"])) if not ok]
+        print(f"VERDICT: KERNEL/LAUNCH_NONDETERMINISM ({'+'.join(bad)}): the same "
+              "input produced different outputs across repeated runs in the "
+              "SAME process/config -> this is not an RNG or LaneVectorize issue. "
+              "Re-run with --sync to test a missing launch/stream sync.",
+              file=sys.stderr)
     elif not report["gem_matches"]:
         if label_a == label_b:
-            print("VERDICT: KERNEL/LAUNCH_NONDETERMINISM (same config, same input,"
-                  " different output across processes)", file=sys.stderr)
+            print("VERDICT: CROSS_PROCESS_NONDETERMINISM (same config/input, "
+                  "different output across processes)", file=sys.stderr)
         else:
             print("VERDICT: CONFIG_DEPENDENCE (same input, ON/OFF gem differs)",
                   file=sys.stderr)
@@ -400,6 +460,84 @@ def _analyze_diag(pattern: str) -> int:
         print("Some tests saw different fingerprints -> the seed is not reaching"
               " the input generator for those "
               "(INPUT_NONDETERMINISM).")
+    return 0
+
+def _triton_probe(args) -> int:
+    """Isolate an Ascend auto-multi-buffer bug with an aliased in-place kernel.
+
+    Runs a trivial `y = x * s` kernel writing back into x (x_ptr == out_ptr),
+    exactly like FlagGems' in-place mul_, N times with multibuffer=True and
+    multibuffer=False. If multibuffer=True is nondeterministic while False is
+    stable, the cause is BishengIR auto multi-buffering of an aliased load/store.
+    """
+    import hashlib
+
+    import torch
+    import triton
+    import triton.language as tl
+
+    import flag_gems
+
+    @triton.jit
+    def _mul_inplace(x_ptr, s, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m)
+        tl.store(x_ptr + offs, x * s, mask=m)
+
+    device = flag_gems.device
+    n = 1024 * 1024
+    scalar = -0.999
+
+    def _hash(t):
+        return hashlib.sha1(
+            t.detach().to("cpu").contiguous().numpy().tobytes()
+        ).hexdigest()[:16]
+
+    _seed(SEED)
+    base = torch.randn(n, dtype=torch.float32, device=device)
+    ref = (base.to("cpu").double() * scalar).to(torch.float32)
+
+    report = {"n": n, "scalar": scalar, "repeat": args.repeat, "runs": {}}
+    for mb in (True, False):
+        hashes = []
+        nbad = []
+        for _ in range(args.repeat):
+            x = base.clone()
+            grid = (triton.cdiv(n, 1024),)
+            try:
+                _mul_inplace[grid](x, scalar, n, BLOCK=1024, multibuffer=mb)
+            except TypeError:
+                # backend may not expose the option name; skip this arm
+                report["runs"][str(mb)] = "unsupported multibuffer kwarg"
+                break
+            hashes.append(_hash(x))
+            r = x.to("cpu")
+            nbad.append(int((~torch.isclose(r, ref, atol=1e-4,
+                                            rtol=1e-4)).sum()))
+        else:
+            report["runs"][str(mb)] = {
+                "hashes": hashes,
+                "n_mismatch": nbad,
+                "deterministic": len(set(hashes)) == 1,
+            }
+    print(json.dumps(report, indent=2, default=str))
+
+    runs = report["runs"]
+    t = runs.get("True")
+    f = runs.get("False")
+    if isinstance(t, dict) and isinstance(f, dict):
+        if not t["deterministic"] and f["deterministic"]:
+            print("VERDICT: AUTO_MULTI_BUFFER_BUG confirmed (aliased in-place "
+                  "kernel nondeterministic with multibuffer=True, stable with "
+                  "False)", file=sys.stderr)
+        elif not t["deterministic"] and not f["deterministic"]:
+            print("VERDICT: aliased in-place kernel nondeterministic even "
+                  "without multi-buffer (deeper backend/runtime issue)",
+                  file=sys.stderr)
+        else:
+            print("VERDICT: aliased in-place kernel stable in this probe; "
+                  "the A/B flake needs another explanation", file=sys.stderr)
     return 0
 
 
