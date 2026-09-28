@@ -110,8 +110,45 @@ def _seed_rngs_from_env() -> None:
 
 
 @pytest.fixture(scope="function", autouse=True)
-def _fixed_random_seed():
+def _fixed_random_seed(request):
     _seed_rngs_from_env()
+    # Optional A/B bisection aid: when FLAG_GEMS_AB_DIAG is set to a file path,
+    # record the per-test RNG fingerprint (CPU seed + accelerator generator
+    # state hash). If two runs of the same test show the SAME fingerprint but a
+    # different pass/fail outcome, the input was identical and the instability
+    # is in the kernel; if the fingerprints differ, the seed is not taking.
+    diag_path = os.environ.get("FLAG_GEMS_AB_DIAG")
+    if diag_path:
+        try:
+            import hashlib
+            import json as _json
+            import time as _time
+
+            import torch
+
+            from flag_gems.runtime import torch_device_fn
+
+            fp = {"cpu_seed": int(torch.initial_seed())}
+            try:
+                gen = torch_device_fn.default_generators[
+                    torch_device_fn.current_device()
+                ]
+                st = gen.get_state()
+                fp["dev_seed"] = int(gen.initial_seed())
+                fp["dev_state"] = hashlib.sha1(
+                    bytes(st.cpu().numpy().tobytes())
+                ).hexdigest()[:16]
+            except Exception as exc:  # noqa: BLE001
+                fp["dev_state"] = f"ERR:{exc}"
+            rec = {
+                "time": _time.strftime("%Y-%m-%d %H:%M:%S"),
+                "nodeid": request.node.nodeid,
+                "fingerprint": fp,
+            }
+            with open(diag_path, "a") as fh:
+                fh.write(_json.dumps(rec) + "\n")
+        except Exception:  # noqa: BLE001 - diagnostics must never break a test
+            pass
 
 
 def pytest_addoption(parser):
