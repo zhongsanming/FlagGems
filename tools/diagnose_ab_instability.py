@@ -463,12 +463,21 @@ def _analyze_diag(pattern: str) -> int:
     return 0
 
 def _triton_probe(args) -> int:
-    """Isolate an Ascend auto-multi-buffer bug with an aliased in-place kernel.
+    """Minimal aliased in-place triton kernels to isolate the nondeterminism.
 
-    Runs a trivial `y = x * s` kernel writing back into x (x_ptr == out_ptr),
-    exactly like FlagGems' in-place mul_, N times with multibuffer=True and
-    multibuffer=False. If multibuffer=True is nondeterministic while False is
-    stable, the cause is BishengIR auto multi-buffering of an aliased load/store.
+    Runs several variants of `x = x * s` (and one out-of-place control) and
+    reports which are deterministic. Variants:
+
+      oop            : y = x * s          (separate buffers, control)
+      inplace        : x = x * s          (aliased, grid = many programs)
+      inplace_grid1  : x = x * s          (aliased, a single program)
+      inplace_barrier: aliased + tl.debug_barrier() before the store
+      inplace_ns1    : aliased + num_stages=1
+      inplace_nombs1 : aliased + multibuffer=False + num_stages=1
+
+    Interpretation: if `oop` is stable but every aliased variant flakes, the
+    bug is triggered purely by x_ptr == out_ptr (aliasing), not by multi-buffer
+    or by cross-program races (inplace_grid1 covers that).
     """
     import hashlib
 
@@ -479,10 +488,24 @@ def _triton_probe(args) -> int:
     import flag_gems
 
     @triton.jit
+    def _mul_oop(x_ptr, y_ptr, s, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        tl.store(y_ptr + offs, tl.load(x_ptr + offs, mask=m) * s, mask=m)
+
+    @triton.jit
     def _mul_inplace(x_ptr, s, n, BLOCK: tl.constexpr):
         offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         m = offs < n
         x = tl.load(x_ptr + offs, mask=m)
+        tl.store(x_ptr + offs, x * s, mask=m)
+
+    @triton.jit
+    def _mul_inplace_barrier(x_ptr, s, n, BLOCK: tl.constexpr):
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m)
+        tl.debug_barrier()
         tl.store(x_ptr + offs, x * s, mask=m)
 
     device = flag_gems.device
@@ -498,46 +521,80 @@ def _triton_probe(args) -> int:
     base = torch.randn(n, dtype=torch.float32, device=device)
     ref = (base.to("cpu").double() * scalar).to(torch.float32)
 
+    def run_oop(block, **kw):
+        y = torch.empty_like(base)
+        _mul_oop[(triton.cdiv(n, block),)](base, y, scalar, n, BLOCK=block, **kw)
+        return y
+
+    def run_inplace(kernel, block, **kw):
+        x = base.clone()
+        kernel[(triton.cdiv(n, block),)](x, scalar, n, BLOCK=block, **kw)
+        return x
+
+    variants = {
+        "oop": (lambda kw: run_oop(1024, **kw), 1024),
+        "inplace": (lambda kw: run_inplace(_mul_inplace, 1024, **kw), 1024),
+        "inplace_grid1": (
+            lambda kw: run_inplace(_mul_inplace, n, **kw), n),
+        "inplace_barrier": (
+            lambda kw: run_inplace(_mul_inplace_barrier, 1024, **kw), 1024),
+        "inplace_ns1": (
+            lambda kw: run_inplace(_mul_inplace, 1024, 
+                                   **{**kw, "num_stages": 1}), 1024),
+        "inplace_nombs1": (
+            lambda kw: run_inplace(_mul_inplace, 1024,
+                                   **{**kw, "num_stages": 1,
+                                      "multibuffer": False}), 1024),
+    }
+
     report = {"n": n, "scalar": scalar, "repeat": args.repeat, "runs": {}}
-    for mb in (True, False):
-        hashes = []
-        nbad = []
-        for _ in range(args.repeat):
-            x = base.clone()
-            grid = (triton.cdiv(n, 1024),)
-            try:
-                _mul_inplace[grid](x, scalar, n, BLOCK=1024, multibuffer=mb)
-            except TypeError:
-                # backend may not expose the option name; skip this arm
-                report["runs"][str(mb)] = "unsupported multibuffer kwarg"
-                break
-            hashes.append(_hash(x))
-            r = x.to("cpu")
-            nbad.append(int((~torch.isclose(r, ref, atol=1e-4,
-                                            rtol=1e-4)).sum()))
-        else:
-            report["runs"][str(mb)] = {
-                "hashes": hashes,
-                "n_mismatch": nbad,
-                "deterministic": len(set(hashes)) == 1,
-            }
+    for name, (fn, _block) in variants.items():
+        hashes, nbad = [], []
+        try:
+            for _ in range(args.repeat):
+                out = fn({})
+                hashes.append(_hash(out))
+                r = out.to("cpu")
+                nbad.append(int((~torch.isclose(r, ref, atol=1e-4,
+                                                rtol=1e-4)).sum()))
+        except Exception as exc:  # noqa: BLE001
+            report["runs"][name] = f"ERROR: {type(exc).__name__}: {exc}"
+            continue
+        report["runs"][name] = {
+            "hashes": hashes, "n_mismatch": nbad,
+            "deterministic": len(set(hashes)) == 1,
+        }
     print(json.dumps(report, indent=2, default=str))
 
-    runs = report["runs"]
-    t = runs.get("True")
-    f = runs.get("False")
-    if isinstance(t, dict) and isinstance(f, dict):
-        if not t["deterministic"] and f["deterministic"]:
-            print("VERDICT: AUTO_MULTI_BUFFER_BUG confirmed (aliased in-place "
-                  "kernel nondeterministic with multibuffer=True, stable with "
-                  "False)", file=sys.stderr)
-        elif not t["deterministic"] and not f["deterministic"]:
-            print("VERDICT: aliased in-place kernel nondeterministic even "
-                  "without multi-buffer (deeper backend/runtime issue)",
+    r = report["runs"]
+
+    def det(name):
+        v = r.get(name)
+        return isinstance(v, dict) and v["deterministic"]
+
+    if det("oop") and not det("inplace"):
+        print("VERDICT: ALIASING is the trigger (out-of-place stable, "
+              "in-place flaky).", file=sys.stderr)
+        if det("inplace_grid1"):
+            print("  single-program in-place is stable -> cross-program "
+                  "interference on aliased memory.", file=sys.stderr)
+        else:
+            print("  single-program in-place is ALSO flaky -> intra-program "
+                  "load/store handling of aliased memory.", file=sys.stderr)
+        if det("inplace_ns1") and det("inplace_nombs1"):
+            print("  FIX: num_stages=1 makes it stable.", file=sys.stderr)
+        elif det("inplace_nombs1"):
+            print("  FIX: multibuffer=False + num_stages=1 makes it stable.",
                   file=sys.stderr)
         else:
-            print("VERDICT: aliased in-place kernel stable in this probe; "
-                  "the A/B flake needs another explanation", file=sys.stderr)
+            print("  neither num_stages=1 nor multibuffer=False stabilises it.",
+                  file=sys.stderr)
+    elif all(det(n) for n in ("oop", "inplace", "inplace_grid1")):
+        print("VERDICT: all variants stable in this probe run; rerun with a "
+              "larger --repeat or a larger n to surface the race.",
+              file=sys.stderr)
+    else:
+        print("VERDICT: see per-variant results above.", file=sys.stderr)
     return 0
 
 
