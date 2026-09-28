@@ -570,26 +570,34 @@ def _triton_probe(args) -> int:
         return x
 
     variants = {
-        "oop": (lambda kw: run_oop(1024, **kw), 1024, 1.0),
-        "inplace": (lambda kw: run_inplace(_mul_inplace, 1024, **kw), 1024, 1.0),
-        "inplace_b1": (lambda kw: run_inplace(_mul_inplace, 1, **kw), 1, 1.0),
-        "inplace_b32": (lambda kw: run_inplace(_mul_inplace, 32, **kw), 32, 1.0),
+        "oop": (lambda kw: run_oop(1024, **kw), 1024, float(scalar)),
+        "inplace": (lambda kw: run_inplace(_mul_inplace, 1024, **kw), 1024,
+                    float(scalar)),
+        "inplace_b1": (lambda kw: run_inplace(_mul_inplace, 1, **kw), 1,
+                       float(scalar)),
+        "inplace_b32": (lambda kw: run_inplace(_mul_inplace, 32, **kw), 32,
+                        float(scalar)),
         "inplace_sync": (
-            lambda kw: run_inplace_sync(_mul_inplace, 1024, **kw), 1024, 1.0),
+            lambda kw: run_inplace_sync(_mul_inplace, 1024, **kw), 1024,
+            float(scalar)),
         "inplace_noclone": (
-            lambda kw: run_inplace_noclone(_mul_inplace, 1024, **kw), 1024, 1.0),
+            lambda kw: run_inplace_noclone(_mul_inplace, 1024, **kw), 1024,
+            float(scalar)),
         "inplace_double": (
             lambda kw: run_inplace_double(_mul_inplace, 1024, **kw), 1024,
             float(scalar) * float(scalar)),
         "inplace_barrier": (
-            lambda kw: run_inplace(_mul_inplace_barrier, 1024, **kw), 1024, 1.0),
+            lambda kw: run_inplace(_mul_inplace_barrier, 1024, **kw), 1024,
+            float(scalar)),
         "inplace_ns1": (
             lambda kw: run_inplace(_mul_inplace, 1024,
-                                   **{**kw, "num_stages": 1}), 1024, 1.0),
+                                   **{**kw, "num_stages": 1}), 1024,
+            float(scalar)),
         "inplace_nombs1": (
             lambda kw: run_inplace(_mul_inplace, 1024,
                                    **{**kw, "num_stages": 1,
-                                      "multibuffer": False}), 1024, 1.0),
+                                      "multibuffer": False}), 1024,
+            float(scalar)),
     }
 
     report = {"n": n, "scalar": scalar, "repeat": args.repeat, "runs": {}}
