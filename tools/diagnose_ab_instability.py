@@ -688,31 +688,41 @@ def _argmax_probe(args) -> int:
         import math
         import triton
 
-        def _run_two(use_sync: bool, zeroed: bool):
+        def _mid_buffers(zeroed):
             M = inp.numel()
             block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
             mid_size = triton.cdiv(M, block_size)
             block_mid = triton.next_power_of_2(mid_size)
-            if zeroed:
-                mid_value = torch.zeros((mid_size,), dtype=dt, device=device)
-                mid_index = torch.zeros((mid_size,), dtype=torch.int64,
-                                        device=device)
-                o = torch.zeros([], dtype=torch.int64, device=device)
-            else:
-                mid_value = torch.empty((mid_size,), dtype=dt, device=device)
-                mid_index = torch.empty((mid_size,), dtype=torch.int64,
-                                        device=device)
-                o = torch.empty([], dtype=torch.int64, device=device)
+            fill = torch.zeros if zeroed else torch.empty
+            mid_value = fill((mid_size,), dtype=dt, device=device)
+            mid_index = fill((mid_size,), dtype=torch.int64, device=device)
+            return M, block_size, mid_size, block_mid, mid_value, mid_index
+
+        def _run_kernel1(zeroed):
+            M, bs, ms, _bm, mv, mi = _mid_buffers(zeroed)
+            am.argmax_kernel_1[(ms, 1, 1)](inp, mv, mi, M, bs)
+            return _hash(mv), _hash(mi)
+
+        def _run_two(use_sync, zeroed):
+            M, bs, ms, bm, mv, mi = _mid_buffers(zeroed)
+            o = torch.empty([], dtype=torch.int64, device=device)
             with torch_device_fn.device(inp.device):
-                am.argmax_kernel_1[(mid_size, 1, 1)](inp, mid_value, mid_index,
-                                                     M, block_size)
+                am.argmax_kernel_1[(ms, 1, 1)](inp, mv, mi, M, bs)
                 if use_sync:
                     torch_device_fn.synchronize()
-                am.argmax_kernel_2[(1, 1, 1)](mid_value, mid_index, o,
-                                              mid_size, block_mid)
+                am.argmax_kernel_2[(1, 1, 1)](mv, mi, o, ms, bm)
             return int(o.to("cpu"))
 
-        for name, sync, zeroed in (("gem_argmax_sync", True, False),
+        # Isolate kernel 1 (per-block tl.max(return_indices=True)).
+        m1 = [_run_kernel1(False) for _ in range(args.repeat)]
+        out["runs"]["kernel1_only"] = {
+            "pairs": [list(p) for p in m1],
+            "distinct": len(set(m1)),
+            "deterministic": len(set(m1)) == 1,
+        }
+
+        for name, sync, zeroed in (("gem_argmax", False, False),
+                                   ("gem_argmax_sync", True, False),
                                    ("gem_argmax_zeroed", False, True),
                                    ("gem_argmax_sync_zeroed", True, True)):
             v = [_run_two(sync, zeroed) for _ in range(args.repeat)]
@@ -729,12 +739,15 @@ def _argmax_probe(args) -> int:
     if not g.get("deterministic"):
         print("VERDICT: argmax is nondeterministic on identical input.",
               file=sys.stderr)
-        for n in ("gem_argmax_sync", "gem_argmax_zeroed",
-                  "gem_argmax_sync_zeroed"):
-            r = out["runs"].get(n)
-            if r and r.get("deterministic"):
-                print(f"  {n} is STABLE -> missing inter-kernel sync / "
-                      f"uninitialised mid buffers is the cause.", file=sys.stderr)
+        k1 = out["runs"].get("kernel1_only", {})
+        if k1 and not k1.get("deterministic"):
+            print("  kernel1_only is ALSO nondeterministic -> the per-block"
+                  " tl.max(return_indices=True) reduction itself is"
+                  " nondeterministic (intra-kernel, independent of sync or"
+                  " buffer initialisation).", file=sys.stderr)
+        elif k1:
+            print("  kernel1_only is stable -> kernel 2 / mid reduction is the"
+                  " nondeterministic one.", file=sys.stderr)
     else:
         print("VERDICT: argmax deterministic this run.", file=sys.stderr)
     return 0
