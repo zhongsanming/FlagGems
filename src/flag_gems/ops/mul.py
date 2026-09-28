@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 from numbers import Number
 
 import torch
@@ -585,6 +586,27 @@ def _launch_generic(a_t, b_t, output, out_shape, a_stride, b_stride, out_stride,
     return output
 
 
+def _aliases_any(out, *ins) -> bool:
+    """True if `out` shares storage with any tensor in `ins`.
+
+    Ascend 910B backs an aliased in-place elementwise load/store incorrectly:
+    repeated runs on the same input produce different, partially-updated
+    outputs (see tools/diagnose_ab_instability.py --triton-probe). When
+    FLAG_GEMS_AVOID_INPLACE_ALIAS=1 we route such calls through a temp buffer.
+    """
+    if out is None or out.numel() == 0:
+        return False
+    out_ptr = out.data_ptr()
+    for t in ins:
+        if isinstance(t, torch.Tensor) and t.numel() and t.data_ptr() == out_ptr:
+            return True
+    return False
+
+
+def _avoid_inplace_alias_enabled() -> bool:
+    return os.environ.get("FLAG_GEMS_AVOID_INPLACE_ALIAS", "0") not in ("0", "", "false", "False")
+
+
 def mul_broadcast_func(a, b, out=None):
     if not (_is_tensor_or_number(a) and _is_tensor_or_number(b)):
         raise TypeError("mul expects tensor or scalar inputs")
@@ -594,6 +616,17 @@ def mul_broadcast_func(a, b, out=None):
         if out is not None:
             return torch.ops.aten.mul.out.redispatch(_FALLBACK_KEYSET, a, b, out=out)
         return torch.ops.aten.mul.Tensor.redispatch(_FALLBACK_KEYSET, a, b)
+
+    # Work around the Ascend aliased in-place load/store bug by computing into
+    # a fresh buffer and copying the result back into `out`.
+    if (
+        out is not None
+        and _avoid_inplace_alias_enabled()
+        and _aliases_any(out, a, b)
+    ):
+        tmp = mul_broadcast_func(a, b, out=None)
+        out.copy_(tmp)
+        return out
 
     dtype = _result_dtype(a, b)
 
