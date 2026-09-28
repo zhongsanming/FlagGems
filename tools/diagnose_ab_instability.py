@@ -26,8 +26,18 @@ Run on the NPU host, e.g.:
     python tools/diagnose_ab_instability.py --op argmax --both-configs
     python tools/diagnose_ab_instability.py --op mul_ --repeat 10 --sync
     python tools/diagnose_ab_instability.py --triton-probe   # backend-only
+    python tools/diagnose_ab_instability.py --env            # compiler fingerprint
 
 Respects FLAG_GEMS_SEED (like the A/B harness). Prints a JSON verdict.
+
+Every report embeds an "env_fingerprint" (triton/flagtree/flag-gems versions
+plus the flagtree / AscendNPU-IR / flag_gems git revisions). Ascend results
+depend on the compiler build, so pin it and guard against silent swaps:
+
+    python tools/diagnose_ab_instability.py --env > env.json
+    python tools/diagnose_ab_instability.py --expect-env env.json --triton-probe
+    python tools/diagnose_ab_instability.py --expect-env \
+        "triton_version=3.5.1,flagtree_git=0afb1367a" --op mul_ --repeat 10
 
 The diagnostic also runs an out-of-place gem path for mul_ and reports
 `oop_deterministic` / `ALIASING_SUSPECT`: in-place is nondeterministic while
@@ -72,6 +82,91 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 
 SEED = int(os.environ.get("FLAG_GEMS_SEED", "0"))
+
+
+def _git_rev(path: Path):
+    """Best-effort git HEAD commit for a source checkout (no subprocess).
+
+    Handles plain repos, worktrees/submodules (`.git` file -> gitdir), the
+    worktree `commondir` indirection, and `packed-refs` fallback.
+    """
+    def read_ref(gitdir: Path, ref: str):
+        name = ref.split(" ", 1)[1].strip() if ref.startswith("ref:") else ref
+        candidates = []
+        cd = gitdir / "commondir"
+        if cd.is_file():
+            common = (gitdir / cd.read_text().strip()).resolve()
+            candidates.append(common / name)
+        candidates.append(gitdir / name)
+        for c in candidates:
+            if c.is_file():
+                return c.read_text().strip()
+        # packed-refs fallback
+        for base in ([common] if cd.is_file() else []) + [gitdir]:
+            pr = base / "packed-refs"
+            if pr.is_file():
+                for line in pr.read_text().splitlines():
+                    if line and line[0] not in "#^" and line.split(" ", 1)[-1] == name:
+                        return line.split(" ", 1)[0]
+        return None
+
+    try:
+        git = path / ".git"
+        if git.is_file():
+            for line in git.read_text().splitlines():
+                if line.startswith("gitdir:"):
+                    git = (path / line.split(":", 1)[1].strip()).resolve()
+                    break
+        head = git / "HEAD"
+        if not head.is_file():
+            return None
+        ref = head.read_text().strip()
+        if not ref.startswith("ref:"):
+            return ref
+        return read_ref(git, ref) or ref
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _env_fingerprint() -> dict:
+    """Identify the exact compiler/toolchain behind a probe run.
+
+    Ascend results depend on flagtree (which provides `triton`) and the bundled
+    AscendNPU-IR/BiShengIR build, not only on FlagGems. Record every version and
+    source revision so results from different compiler builds are never
+    compared as if they were the same.
+    """
+    import importlib.metadata as md
+
+    fp: dict = {}
+    try:
+        import triton
+
+        fp["triton_version"] = getattr(triton, "__version__", None)
+        fp["triton_file"] = getattr(triton, "__file__", None)
+    except Exception as exc:  # noqa: BLE001
+        fp["triton_version"] = f"ERR:{exc}"
+    for pkg in ("flagtree", "flag-gems", "torch", "torch-npu"):
+        try:
+            fp[f"{pkg}_version"] = md.version(pkg)
+        except Exception:  # noqa: BLE001
+            fp[f"{pkg}_version"] = None
+    for key, p in (
+        ("flagtree_git", ROOT.parent / "flagtree"),
+        ("ascend_npu_ir_git", ROOT.parent / "AscendNPU-IR"),
+        ("ascend_npu_ir_bundled_git",
+         ROOT.parent / "flagtree/third_party/ascend/AscendNPU-IR"),
+        ("flag_gems_git", ROOT),
+    ):
+        fp[key] = _git_rev(p)
+    fp["env"] = {k: os.environ.get(k) for k in (
+        "FLAG_GEMS_SEED", "FLAG_GEMS_AVOID_INPLACE_ALIAS",
+        "TRITON_DISABLE_LANE_VECTORIZE",
+        "TRITON_ENABLE_LANE_VECTORIZE_BLOCK_MODE",
+        "TRITON_LANE_VECTORIZE_ALLOW_CONCAT",
+        "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES",
+        "FLAGGEMS_CACHE_DIR", "TRITON_CACHE_DIR")}
+    return fp
 
 
 def _seed(seed: int) -> None:
@@ -136,7 +231,8 @@ def diagnose(op: str, shape, dtype, scalar, device, repeat: int,
                 fn()
 
     out: dict = {"op": op, "shape": list(shape), "dtype": str(dtype),
-                 "scalar": scalar, "seed": SEED, "repeat": repeat}
+                 "scalar": scalar, "seed": SEED, "repeat": repeat,
+                 "env_fingerprint": _env_fingerprint()}
 
     # ---- (I) input determinism under the seed --------------------------------
     if op == "argmax":
@@ -252,7 +348,24 @@ def main(argv=None) -> int:
                     help="minimal aliased in-place triton kernel, run with "
                          "multibuffer on/off, to isolate an Ascend auto "
                          "multi-buffer bug independent of FlagGems")
+    ap.add_argument("--env", action="store_true",
+                    help="print only the compiler/toolchain fingerprint "
+                         "(triton/flagtree/AscendNPU-IR/flag_gems revisions) "
+                         "and exit; use this to pin/compare compiler builds")
+    ap.add_argument("--expect-env", metavar="JSON_OR_KEY=VAL,...",
+                    help="abort unless the runtime fingerprint matches. Pass a "
+                         "JSON file/dict or comma key=val pairs, e.g. "
+                         "triton_version=3.5.1,flagtree_git=0afb1367a")
     args = ap.parse_args(argv)
+
+    if args.expect_env:
+        rc = _check_expected_env(args.expect_env)
+        if rc != 0:
+            return rc
+
+    if args.env:
+        print(json.dumps(_env_fingerprint(), indent=2, default=str))
+        return 0
 
     if args.triton_probe:
         return _triton_probe(args)
@@ -364,6 +477,8 @@ def _run_pair(label_a: str, label_b: str, args) -> int:
                 cmd += ["--shape", args.shape]
             if args.sync:
                 cmd += ["--sync"]
+            if args.expect_env:
+                cmd += ["--expect-env", args.expect_env]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             results[tag] = _extract_json(proc.stdout) or {
                 "error": proc.stdout + proc.stderr}
@@ -377,6 +492,7 @@ def _run_pair(label_a: str, label_b: str, args) -> int:
         return 1
     report = {
         "op": args.op, "dtype": args.dtype, "shape": args.shape,
+        "env_fingerprint": _env_fingerprint(),
         "A_config": label_a, "B_config": label_b,
         "input_hash_A": a.get("input_hash_1"),
         "input_hash_B": b.get("input_hash_1"),
@@ -410,6 +526,37 @@ def _run_pair(label_a: str, label_b: str, args) -> int:
     else:
         print("VERDICT: identical input and output -> not reproducible this run",
               file=sys.stderr)
+    return 0
+
+
+def _check_expected_env(spec: str) -> int:
+    """Abort if the runtime fingerprint does not match `spec`.
+
+    `spec` is either a path to a JSON file (as produced by --env / a previous
+    report), a JSON object string, or a comma-separated list of key=value
+    pairs. Only the listed keys are checked. Exits 3 on mismatch so a study
+    cannot silently compare results from different compiler builds.
+    """
+    want: dict = {}
+    p = Path(spec)
+    if p.is_file():
+        want = json.loads(p.read_text())
+    elif spec.lstrip().startswith("{"):
+        want = json.loads(spec)
+    else:
+        for part in spec.split(","):
+            if "=" not in part:
+                continue
+            k, v = part.split("=", 1)
+            want[k.strip()] = v.strip()
+    got = _env_fingerprint()
+    bad = {k: (want[k], got.get(k)) for k in want if str(got.get(k)) != str(want[k])}
+    if bad:
+        print("ENV MISMATCH - refusing to compare across builds:", file=sys.stderr)
+        for k, (w, g) in bad.items():
+            print(f"  {k}: expected {w!r}, got {g!r}", file=sys.stderr)
+        return 3
+    print(f"env fingerprint matches ({len(want)} keys checked)", file=sys.stderr)
     return 0
 
 
@@ -600,7 +747,8 @@ def _triton_probe(args) -> int:
             float(scalar)),
     }
 
-    report = {"n": n, "scalar": scalar, "repeat": args.repeat, "runs": {}}
+    report = {"n": n, "scalar": scalar, "repeat": args.repeat,
+              "env_fingerprint": _env_fingerprint(), "runs": {}}
     for name, (fn, block, applied) in variants.items():
         ref_v = (base.to("cpu").double() * applied).to(torch.float32)
         hashes, nbad, last_pos = [], [], None
