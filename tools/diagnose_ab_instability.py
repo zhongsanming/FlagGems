@@ -468,18 +468,20 @@ def _triton_probe(args) -> int:
     Runs several variants of `x = x * s` (and one out-of-place control) and
     reports which are deterministic. Variants:
 
-      oop            : y = x * s          (separate buffers, control)
-      inplace        : x = x * s          (aliased, BLOCK=1024)
-      inplace_b1     : x = x * s          (aliased, BLOCK=1, one elem/row)
-      inplace_b32    : x = x * s          (aliased, BLOCK=32)
-      inplace_barrier: aliased + tl.debug_barrier() before the store
-      inplace_ns1    : aliased + num_stages=1
-      inplace_nombs1 : aliased + multibuffer=False + num_stages=1
+      oop             : y = x * s          (separate buffers, control)
+      inplace         : x = x * s          (aliased, x = base.clone())
+      inplace_b1      : aliased, BLOCK=1 (one element per program)
+      inplace_b32     : aliased, BLOCK=32
+      inplace_sync    : aliased + device sync after clone, before the kernel
+      inplace_noclone : x created without a preceding clone()
+      inplace_double  : run the aliased kernel twice
+      inplace_barrier : aliased + tl.debug_barrier() before the store
+      inplace_ns1     : aliased + num_stages=1
+      inplace_nombs1  : aliased + multibuffer=False + num_stages=1
 
-    Also reports the positions (and position mod BLOCK) of the bad elements,
-    to reveal a per-program / per-vector-lane boundary. Interpretation: if `oop`
-    is stable but every aliased variant flakes, the bug is triggered purely by
-    x_ptr == out_ptr; if BLOCK=1 is stable too, it needs vectorization.
+    Reports the positions (and position mod BLOCK) of the bad elements, to
+    reveal a per-program boundary, and whether a sync or the absence of a
+    preceding clone stabilises the kernel.
     """
     import hashlib
 
@@ -488,6 +490,7 @@ def _triton_probe(args) -> int:
     import triton.language as tl
 
     import flag_gems
+    from flag_gems.runtime import torch_device_fn
 
     @triton.jit
     def _mul_oop(x_ptr, y_ptr, s, n, BLOCK: tl.constexpr):
@@ -523,13 +526,16 @@ def _triton_probe(args) -> int:
     base = torch.randn(n, dtype=torch.float32, device=device)
     ref = (base.to("cpu").double() * scalar).to(torch.float32)
 
-    def _bad_positions(out, block):
+    def _bad_positions(out, block, ref_v):
         r = out.to("cpu")
-        bad = (~torch.isclose(r, ref, atol=1e-4, rtol=1e-4)).nonzero()
-        pos = bad.reshape(-1).tolist()[:16]
+        bad = (~torch.isclose(r, ref_v, atol=1e-4, rtol=1e-4)).nonzero()
+        pos_all = bad.reshape(-1).tolist()
+        pos = pos_all[:16]
         return {
             "n": int(bad.numel()),
             "first_positions": pos,
+            "min_position": (min(pos_all) if pos_all else None),
+            "max_position": (max(pos_all) if pos_all else None),
             "positions_mod_block": sorted({p % block for p in pos}),
         }
 
@@ -543,30 +549,58 @@ def _triton_probe(args) -> int:
         kernel[(triton.cdiv(n, block),)](x, scalar, n, BLOCK=block, **kw)
         return x
 
+    def run_inplace_sync(kernel, block, **kw):
+        x = base.clone()
+        torch_device_fn.synchronize()
+        kernel[(triton.cdiv(n, block),)](x, scalar, n, BLOCK=block, **kw)
+        return x
+
+    def run_inplace_noclone(kernel, block, **kw):
+        # x is freshly allocated by a kernel that is NOT clone(), to test
+        # whether the hazard is specific to an immediately preceding copy.
+        x = torch.randn(n, dtype=torch.float32, device=device) * 0 + base
+        kernel[(triton.cdiv(n, block),)](x, scalar, n, BLOCK=block, **kw)
+        return x
+
+    def run_inplace_double(kernel, block, **kw):
+        x = base.clone()
+        grid = (triton.cdiv(n, block),)
+        kernel[grid](x, scalar, n, BLOCK=block, **kw)
+        kernel[grid](x, scalar, n, BLOCK=block, **kw)  # apply twice
+        return x
+
     variants = {
-        "oop": (lambda kw: run_oop(1024, **kw), 1024),
-        "inplace": (lambda kw: run_inplace(_mul_inplace, 1024, **kw), 1024),
-        "inplace_b1": (lambda kw: run_inplace(_mul_inplace, 1, **kw), 1),
-        "inplace_b32": (lambda kw: run_inplace(_mul_inplace, 32, **kw), 32),
+        "oop": (lambda kw: run_oop(1024, **kw), 1024, 1.0),
+        "inplace": (lambda kw: run_inplace(_mul_inplace, 1024, **kw), 1024, 1.0),
+        "inplace_b1": (lambda kw: run_inplace(_mul_inplace, 1, **kw), 1, 1.0),
+        "inplace_b32": (lambda kw: run_inplace(_mul_inplace, 32, **kw), 32, 1.0),
+        "inplace_sync": (
+            lambda kw: run_inplace_sync(_mul_inplace, 1024, **kw), 1024, 1.0),
+        "inplace_noclone": (
+            lambda kw: run_inplace_noclone(_mul_inplace, 1024, **kw), 1024, 1.0),
+        "inplace_double": (
+            lambda kw: run_inplace_double(_mul_inplace, 1024, **kw), 1024,
+            float(scalar) * float(scalar)),
         "inplace_barrier": (
-            lambda kw: run_inplace(_mul_inplace_barrier, 1024, **kw), 1024),
+            lambda kw: run_inplace(_mul_inplace_barrier, 1024, **kw), 1024, 1.0),
         "inplace_ns1": (
             lambda kw: run_inplace(_mul_inplace, 1024,
-                                   **{**kw, "num_stages": 1}), 1024),
+                                   **{**kw, "num_stages": 1}), 1024, 1.0),
         "inplace_nombs1": (
             lambda kw: run_inplace(_mul_inplace, 1024,
                                    **{**kw, "num_stages": 1,
-                                      "multibuffer": False}), 1024),
+                                      "multibuffer": False}), 1024, 1.0),
     }
 
     report = {"n": n, "scalar": scalar, "repeat": args.repeat, "runs": {}}
-    for name, (fn, block) in variants.items():
+    for name, (fn, block, applied) in variants.items():
+        ref_v = (base.to("cpu").double() * applied).to(torch.float32)
         hashes, nbad, last_pos = [], [], None
         try:
             for _ in range(args.repeat):
                 out = fn({})
                 hashes.append(_hash(out))
-                info = _bad_positions(out, block)
+                info = _bad_positions(out, block, ref_v)
                 nbad.append(info["n"])
                 last_pos = info
         except Exception as exc:  # noqa: BLE001
@@ -594,6 +628,18 @@ def _triton_probe(args) -> int:
         else:
             print("  BLOCK=1 in-place is ALSO flaky -> pure aliasing, "
                   "independent of tile width.", file=sys.stderr)
+        if det("inplace_sync"):
+            print("  inplace_sync is STABLE -> the hazard is a missing "
+                  "sync between the producer (clone) and the aliased kernel,"
+                  " NOT the kernel math.", file=sys.stderr)
+        if det("inplace_noclone"):
+            print("  inplace_noclone is STABLE -> the hazard requires an "
+                  "immediately preceding copy/clone into the aliased buffer.",
+                  file=sys.stderr)
+        else:
+            print("  inplace_noclone is ALSO flaky -> the aliased kernel "
+                  "itself is wrong regardless of how x was produced.",
+                  file=sys.stderr)
         if det("inplace_ns1") and det("inplace_nombs1"):
             print("  FIX: num_stages=1 makes it stable.", file=sys.stderr)
         elif det("inplace_nombs1"):
