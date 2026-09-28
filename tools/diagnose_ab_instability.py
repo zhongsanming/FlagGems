@@ -469,15 +469,17 @@ def _triton_probe(args) -> int:
     reports which are deterministic. Variants:
 
       oop            : y = x * s          (separate buffers, control)
-      inplace        : x = x * s          (aliased, grid = many programs)
-      inplace_grid1  : x = x * s          (aliased, a single program)
+      inplace        : x = x * s          (aliased, BLOCK=1024)
+      inplace_b1     : x = x * s          (aliased, BLOCK=1, one elem/row)
+      inplace_b32    : x = x * s          (aliased, BLOCK=32)
       inplace_barrier: aliased + tl.debug_barrier() before the store
       inplace_ns1    : aliased + num_stages=1
       inplace_nombs1 : aliased + multibuffer=False + num_stages=1
 
-    Interpretation: if `oop` is stable but every aliased variant flakes, the
-    bug is triggered purely by x_ptr == out_ptr (aliasing), not by multi-buffer
-    or by cross-program races (inplace_grid1 covers that).
+    Also reports the positions (and position mod BLOCK) of the bad elements,
+    to reveal a per-program / per-vector-lane boundary. Interpretation: if `oop`
+    is stable but every aliased variant flakes, the bug is triggered purely by
+    x_ptr == out_ptr; if BLOCK=1 is stable too, it needs vectorization.
     """
     import hashlib
 
@@ -521,6 +523,16 @@ def _triton_probe(args) -> int:
     base = torch.randn(n, dtype=torch.float32, device=device)
     ref = (base.to("cpu").double() * scalar).to(torch.float32)
 
+    def _bad_positions(out, block):
+        r = out.to("cpu")
+        bad = (~torch.isclose(r, ref, atol=1e-4, rtol=1e-4)).nonzero()
+        pos = bad.reshape(-1).tolist()[:16]
+        return {
+            "n": int(bad.numel()),
+            "first_positions": pos,
+            "positions_mod_block": sorted({p % block for p in pos}),
+        }
+
     def run_oop(block, **kw):
         y = torch.empty_like(base)
         _mul_oop[(triton.cdiv(n, block),)](base, y, scalar, n, BLOCK=block, **kw)
@@ -534,12 +546,12 @@ def _triton_probe(args) -> int:
     variants = {
         "oop": (lambda kw: run_oop(1024, **kw), 1024),
         "inplace": (lambda kw: run_inplace(_mul_inplace, 1024, **kw), 1024),
-        "inplace_grid1": (
-            lambda kw: run_inplace(_mul_inplace, n, **kw), n),
+        "inplace_b1": (lambda kw: run_inplace(_mul_inplace, 1, **kw), 1),
+        "inplace_b32": (lambda kw: run_inplace(_mul_inplace, 32, **kw), 32),
         "inplace_barrier": (
             lambda kw: run_inplace(_mul_inplace_barrier, 1024, **kw), 1024),
         "inplace_ns1": (
-            lambda kw: run_inplace(_mul_inplace, 1024, 
+            lambda kw: run_inplace(_mul_inplace, 1024,
                                    **{**kw, "num_stages": 1}), 1024),
         "inplace_nombs1": (
             lambda kw: run_inplace(_mul_inplace, 1024,
@@ -548,20 +560,21 @@ def _triton_probe(args) -> int:
     }
 
     report = {"n": n, "scalar": scalar, "repeat": args.repeat, "runs": {}}
-    for name, (fn, _block) in variants.items():
-        hashes, nbad = [], []
+    for name, (fn, block) in variants.items():
+        hashes, nbad, last_pos = [], [], None
         try:
             for _ in range(args.repeat):
                 out = fn({})
                 hashes.append(_hash(out))
-                r = out.to("cpu")
-                nbad.append(int((~torch.isclose(r, ref, atol=1e-4,
-                                                rtol=1e-4)).sum()))
+                info = _bad_positions(out, block)
+                nbad.append(info["n"])
+                last_pos = info
         except Exception as exc:  # noqa: BLE001
             report["runs"][name] = f"ERROR: {type(exc).__name__}: {exc}"
             continue
         report["runs"][name] = {
             "hashes": hashes, "n_mismatch": nbad,
+            "last_positions": last_pos,
             "deterministic": len(set(hashes)) == 1,
         }
     print(json.dumps(report, indent=2, default=str))
@@ -575,21 +588,22 @@ def _triton_probe(args) -> int:
     if det("oop") and not det("inplace"):
         print("VERDICT: ALIASING is the trigger (out-of-place stable, "
               "in-place flaky).", file=sys.stderr)
-        if det("inplace_grid1"):
-            print("  single-program in-place is stable -> cross-program "
-                  "interference on aliased memory.", file=sys.stderr)
+        if det("inplace_b1"):
+            print("  BLOCK=1 in-place is stable -> needs vectorization "
+                  "(multi-element tile) to trigger.", file=sys.stderr)
         else:
-            print("  single-program in-place is ALSO flaky -> intra-program "
-                  "load/store handling of aliased memory.", file=sys.stderr)
+            print("  BLOCK=1 in-place is ALSO flaky -> pure aliasing, "
+                  "independent of tile width.", file=sys.stderr)
         if det("inplace_ns1") and det("inplace_nombs1"):
             print("  FIX: num_stages=1 makes it stable.", file=sys.stderr)
         elif det("inplace_nombs1"):
             print("  FIX: multibuffer=False + num_stages=1 makes it stable.",
                   file=sys.stderr)
         else:
-            print("  neither num_stages=1 nor multibuffer=False stabilises it.",
+            print("  neither num_stages=1 nor multibuffer=False stabilises it"
+                  " -> the only reliable fix is to avoid aliasing.",
                   file=sys.stderr)
-    elif all(det(n) for n in ("oop", "inplace", "inplace_grid1")):
+    elif all(det(n) for n in ("oop", "inplace")):
         print("VERDICT: all variants stable in this probe run; rerun with a "
               "larger --repeat or a larger n to surface the race.",
               file=sys.stderr)
