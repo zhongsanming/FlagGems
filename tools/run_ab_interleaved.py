@@ -24,6 +24,14 @@ TTIR is <out>/<config>/cache/npu<N>/<hash>/<kernel>.ttir. Dumps are printed in
 MLIR generic op form by default via TRITON_MLIR_PRINT_OP_GENERIC=1 (equivalent
 to --mlir-print-op-generic); pass --no-generic-ir to keep the custom printer.
 
+FlagGems' own persistent caches are isolated the same way: each (config, NPU)
+gets FLAGGEMS_CACHE_DIR=<out>/<config>/flag_gems_cache/npu<N>. This keeps every
+worker off a shared runtime-autotune config DB (config_cache/TunedConfig_*.db),
+whose contents otherwise depend on which worker tuned first and can change the
+chosen kernel config (and therefore, for reductions, the fp accumulation order)
+between a whole-op run and its retries -- the source of spurious flaky accuracy
+results.
+
 Benchmarks use ``--metrics latency`` only, so the torch/native baseline is
 never timed (no latency_base / speedup / tflops / gbps). Accuracy keeps
 ``--ref cpu`` (the torch CPU reference; there is no non-torch reference in the
@@ -247,6 +255,15 @@ def build_env(npu: int, config: str, cache_dir: Path,
     # Force a fresh compilation and keep every dumped stage in this run's cache.
     env["TRITON_ALWAYS_COMPILE"] = "1"
     env["TRITON_CACHE_DIR"] = str(cache_dir)
+    # Isolate FlagGems' own persistent caches (notably the runtime autotune
+    # config DB at <dir>/config_cache/TunedConfig_*.db). A single shared DB is
+    # read/written by every NPU worker, both compiler configs and every run, so
+    # the autotuner's winning config (and hence, for reductions, the fp
+    # accumulation order) can differ between the whole-op run and its retries,
+    # producing spurious flaky accuracy results. Give each (config, npu) its
+    # own cache root, mirroring TRITON_CACHE_DIR above.
+    env["FLAGGEMS_CACHE_DIR"] = str(cache_dir.parent.parent / "flag_gems_cache"
+                                    / cache_dir.name)
     # Print dumped stage IR (including .ttir) in MLIR generic op form, i.e.
     # --mlir-print-op-generic, for canonical/diffable dumps.
     env["TRITON_MLIR_PRINT_OP_GENERIC"] = "1" if generic_ir else "0"
