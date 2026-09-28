@@ -32,6 +32,13 @@ chosen kernel config (and therefore, for reductions, the fp accumulation order)
 between a whole-op run and its retries -- the source of spurious flaky accuracy
 results.
 
+For deeper bisection, export FLAG_GEMS_AB_DIAG=1 to make every subprocess write
+a per-test RNG fingerprint to <out>/<config>/diag/<config>.npu<N>.jsonl. Compare
+the fingerprints of a test that flips: same fingerprint + different outcome
+means the kernel/launch is nondeterministic (input was identical), while
+different fingerprints mean the seed is not reaching the input generator. See
+tools/diagnose_ab_instability.py.
+
 Benchmarks use ``--metrics latency`` only, so the torch/native baseline is
 never timed (no latency_base / speedup / tflops / gbps). Accuracy keeps
 ``--ref cpu`` (the torch CPU reference; there is no non-torch reference in the
@@ -264,6 +271,14 @@ def build_env(npu: int, config: str, cache_dir: Path,
     # own cache root, mirroring TRITON_CACHE_DIR above.
     env["FLAGGEMS_CACHE_DIR"] = str(cache_dir.parent.parent / "flag_gems_cache"
                                     / cache_dir.name)
+    # Optional per-test RNG/input fingerprinting for bisecting A/B instability.
+    # If the caller exports FLAG_GEMS_AB_DIAG=1, give every (config, NPU) its own
+    # JSONL file so the pytest-side diagnostic fixture (tests/conftest.py) can
+    # record the seed/gen-state fingerprint of each test without contention.
+    if env.get("FLAG_GEMS_AB_DIAG"):
+        diag_dir = cache_dir.parent.parent / "diag"
+        ensure_dir(diag_dir)
+        env["FLAG_GEMS_AB_DIAG"] = str(diag_dir / f"{config}.npu{cache_dir.name[3:]}.jsonl")
     # Print dumped stage IR (including .ttir) in MLIR generic op form, i.e.
     # --mlir-print-op-generic, for canonical/diffable dumps.
     env["TRITON_MLIR_PRINT_OP_GENERIC"] = "1" if generic_ir else "0"
