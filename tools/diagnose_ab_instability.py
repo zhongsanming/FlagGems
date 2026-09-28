@@ -348,6 +348,10 @@ def main(argv=None) -> int:
                     help="minimal aliased in-place triton kernel, run with "
                          "multibuffer on/off, to isolate an Ascend auto "
                          "multi-buffer bug independent of FlagGems")
+    ap.add_argument("--argmax-probe", action="store_true",
+                    help="reproduce the global-argmax nondeterminism and test "
+                         "whether an inter-kernel sync / uninitialised mid "
+                         "buffers are the cause")
     ap.add_argument("--env", action="store_true",
                     help="print only the compiler/toolchain fingerprint "
                          "(triton/flagtree/AscendNPU-IR/flag_gems revisions) "
@@ -366,6 +370,9 @@ def main(argv=None) -> int:
     if args.env:
         print(json.dumps(_env_fingerprint(), indent=2, default=str))
         return 0
+
+    if args.argmax_probe:
+        return _argmax_probe(args)
 
     if args.triton_probe:
         return _triton_probe(args)
@@ -608,6 +615,120 @@ def _analyze_diag(pattern: str) -> int:
               " the input generator for those "
               "(INPUT_NONDETERMINISM).")
     return 0
+
+def _argmax_probe(args) -> int:
+    """Reproduce the global-argmax nondeterminism and test its mechanism.
+
+    The gem global argmax runs two kernels (argmax_kernel_1 -> mid buffers,
+    then argmax_kernel_2 consumes them). The mid buffers are torch.empty, so a
+    missed producer->consumer sync lets kernel 2 read uninitialized values and
+    return a wrong (but deterministic-for-that-read) index.
+
+    Variants, repeated N times on one fixed input:
+      gem_argmax         : flag_gems.flash... i.e. the real op
+      gem_argmax_sync    : same, but a device sync between the two kernels
+      gem_argmax_zeroed  : mid buffers zero-initialised (no uninitialised race)
+
+    If gem_argmax is flaky but gem_argmax_sync / gem_argmax_zeroed are stable,
+    the cause is a missing inter-kernel sync feeding from uninitialised memory.
+    """
+    import hashlib
+
+    import torch
+
+    import flag_gems
+    from flag_gems.runtime import torch_device_fn
+
+    device = flag_gems.device
+    shape = (200, 2560, 3)
+    dt = torch.float32
+
+    def _hash(t):
+        return hashlib.sha1(
+            t.detach().to("cpu").contiguous().numpy().tobytes()
+        ).hexdigest()[:16]
+
+    _seed(SEED)
+    inp = torch.randn(shape, dtype=dt, device=device)
+    out: dict = {
+        "shape": list(shape), "dtype": str(dt), "repeat": args.repeat,
+        "env_fingerprint": _env_fingerprint(), "runs": {},
+    }
+
+    # Reference (CPU).
+    out["ref_scalar"] = int(torch.argmax(inp.to("cpu"), dim=None))
+
+    # Real gem op.
+    vals = []
+    for _ in range(args.repeat):
+        x = inp.clone()
+        with flag_gems.use_gems():
+            r = torch.argmax(x, dim=None, keepdim=False)
+        vals.append(int(r.to("cpu")))
+    out["runs"]["gem_argmax"] = {
+        "scalars": vals, "distinct": len(set(vals)),
+        "deterministic": len(set(vals)) == 1,
+        "matches_ref": all(v == out["ref_scalar"] for v in vals),
+    }
+
+    # Drive the two internal kernels directly with/without an explicit sync.
+    try:
+        from flag_gems.runtime.backend._ascend.ops import argmax as am
+
+        import math
+        import triton
+
+        def _run_two(use_sync: bool, zeroed: bool):
+            M = inp.numel()
+            block_size = triton.next_power_of_2(math.ceil(math.sqrt(M)))
+            mid_size = triton.cdiv(M, block_size)
+            block_mid = triton.next_power_of_2(mid_size)
+            if zeroed:
+                mid_value = torch.zeros((mid_size,), dtype=dt, device=device)
+                mid_index = torch.zeros((mid_size,), dtype=torch.int64,
+                                        device=device)
+                o = torch.zeros([], dtype=torch.int64, device=device)
+            else:
+                mid_value = torch.empty((mid_size,), dtype=dt, device=device)
+                mid_index = torch.empty((mid_size,), dtype=torch.int64,
+                                        device=device)
+                o = torch.empty([], dtype=torch.int64, device=device)
+            with torch_device_fn.device(inp.device):
+                am.argmax_kernel_1[(mid_size, 1, 1)](inp, mid_value, mid_index,
+                                                     M, block_size)
+                if use_sync:
+                    torch_device_fn.synchronize()
+                am.argmax_kernel_2[(1, 1, 1)](mid_value, mid_index, o,
+                                              mid_size, block_mid)
+            return int(o.to("cpu"))
+
+        for name, sync, zeroed in (("gem_argmax_sync", True, False),
+                                   ("gem_argmax_zeroed", False, True),
+                                   ("gem_argmax_sync_zeroed", True, True)):
+            v = [_run_two(sync, zeroed) for _ in range(args.repeat)]
+            out["runs"][name] = {
+                "scalars": v, "distinct": len(set(v)),
+                "deterministic": len(set(v)) == 1,
+                "matches_ref": all(x == out["ref_scalar"] for x in v),
+            }
+    except Exception as exc:  # noqa: BLE001
+        out["internal_probe_error"] = f"{type(exc).__name__}: {exc}"
+
+    print(json.dumps(out, indent=2, default=str))
+    g = out["runs"].get("gem_argmax", {})
+    if not g.get("deterministic"):
+        print("VERDICT: argmax is nondeterministic on identical input.",
+              file=sys.stderr)
+        for n in ("gem_argmax_sync", "gem_argmax_zeroed",
+                  "gem_argmax_sync_zeroed"):
+            r = out["runs"].get(n)
+            if r and r.get("deterministic"):
+                print(f"  {n} is STABLE -> missing inter-kernel sync / "
+                      f"uninitialised mid buffers is the cause.", file=sys.stderr)
+    else:
+        print("VERDICT: argmax deterministic this run.", file=sys.stderr)
+    return 0
+
 
 def _triton_probe(args) -> int:
     """Minimal aliased in-place triton kernels to isolate the nondeterminism.
