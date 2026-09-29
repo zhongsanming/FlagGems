@@ -9,21 +9,24 @@ kernel that reads and writes the SAME buffer (an in-place elementwise op,
 ``x = x * s``) returns a DIFFERENT, partially-updated result on every run of an
 identical input.
 
-The equivalent out-of-place kernel (``y = x * s``, separate buffers) is stable,
-so the fault is specific to the aliased load/store dataflow.
+The equivalent out-of-place kernel (``y = x * s``, separate buffers) is stable.
+
+Trigger (confirmed)
+-------------------
+The nondeterminism only appears when the flagtree Ascend **auto-blockify** pass
+is enabled, i.e. when ``TRITON_ALL_BLOCKS_PARALLEL=1`` is set for the
+compilation (``--enable-auto-blockify-loop``). This script therefore exports
+that variable by default; ``--no-all-blocks-parallel`` is the stable control.
+(FlagGems used to leak this variable at import time, which is what made
+``import flag_gems`` look like the trigger.)
 
 Scope / ownership
 -----------------
-This script uses ONLY torch + triton. It does not import FlagGems, and the
-kernel is a plain ``@triton.jit`` function, so the nondeterminism is produced by
-the triton/flagtree -> AscendNPU-IR compilation+execution path.
-
-Flagtree's own lowering is correct: the linalg/ttadapter IR it emits for this
-kernel loads x into a distinct ``memref.alloc`` temp, computes, then stores, so
-the read fully precedes the write (see the note at the bottom). The bad result
-appears only after ``bishengir-compile`` (AscendNPU-IR) turns that IR into a
-binary, which points at AscendNPU-IR memory planning / HIVM sync / (auto)
-multi-buffer handling of the two aliased memrefs.
+This script uses ONLY torch + triton; no FlagGems import is required. So the
+defect is in the triton/flagtree -> AscendNPU-IR pipeline under auto-blockify.
+Flagtree's linalg for this kernel loads x into a distinct ``memref.alloc`` temp
+before storing (well-formed read-before-write); the nondeterminism comes from the
+auto-blockify scheduling that follows.
 
 What is NOT the cause (already ruled out on the affected build)
 ---------------------------------------------------------------
@@ -35,9 +38,9 @@ What is NOT the cause (already ruled out on the affected build)
 
 Run
 ---
-    python repro_inplace_alias_nondeterminism.py
-    python repro_inplace_alias_nondeterminism.py --repeat 20 --n 1048576
-    python repro_inplace_alias_nondeterminism.py --device 2
+    python repro_inplace_alias_nondeterminism.py --fresh-cache
+    python repro_inplace_alias_nondeterminism.py --device 2 --repeat 20 --fresh-cache
+    python repro_inplace_alias_nondeterminism.py --no-all-blocks-parallel --fresh-cache  # control
 
 Expected output: the ``aliased`` block prints ``deterministic: False`` with
 several distinct hashes and ~BLOCK non-zero mismatches, while the ``oop`` control
@@ -88,11 +91,20 @@ def main() -> int:
     ap.add_argument("--fresh-cache", action="store_true",
                     help="use a private TRITON_CACHE_DIR / FLAGGEMS_CACHE_DIR "
                          "and TRITON_ALWAYS_COMPILE=1 (fresh compile)")
+    ap.add_argument("--no-all-blocks-parallel", action="store_true",
+                    help="do not set TRITON_ALL_BLOCKS_PARALLEL (used as a "
+                         "control: with it unset the kernel is deterministic)")
     args = ap.parse_args()
 
     if args.device is not None:
         for var in ("ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"):
             os.environ[var] = str(args.device)
+    # The trigger: enabling the flagtree Ascend auto-blockify pass makes this
+    # kernel nondeterministic. Set it explicitly so no flag_gems import is needed.
+    if not args.no_all_blocks_parallel:
+        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
+    else:
+        os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
     if args.fresh_cache:
         import tempfile
 
