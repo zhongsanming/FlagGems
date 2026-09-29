@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""Bisect which part of `import flag_gems` triggers the Ascend nondeterminism.
+"""Bisect what triggers the Ascend nondeterminism observed via the diagnose tool.
 
-Observations so far:
-  * A triton-only script (no flag_gems) does NOT reproduce the nondeterminism.
-  * Adding `import flag_gems` DOES reproduce it (aliased in-place elementwise,
-    and tl.max(return_indices=True)) on
-    flagtree 0.7.0+ascend.git0afb1367 / AscendNPU-IR 3545d1cb.
+Facts:
+  * A triton-only script does NOT reproduce it.
+  * The standalone repro with `--import-flaggems` DOES (per the reporter).
+  * Importing flag_gems submodules progressively did NOT reproduce it.
 
-This helper imports flag_gems progressively and re-runs the aliased kernel after
-each step, printing whether the kernel is deterministic. The first import that
-flips it from deterministic to nondeterministic is the trigger.
+So the trigger is not a single import; it is some *action* the diagnose tool
+takes. This script runs the aliased kernel in a fresh subprocess under a matrix
+of candidate triggers and reports which combination flips it from deterministic
+to nondeterministic. Candidates (cumulative `--setup` levels):
 
-Run (must be a fresh process per step; this script does that itself):
+  0 triton_only         import torch/triton, run kernel
+  1 seed_cpu            + torch.manual_seed
+  2 seed_device         + torch.npu.manual_seed_all (or torch_device_fn)
+  3 import_flag_gems    + import flag_gems ; dev = flag_gems.device
+  4 gems_device_seed    + torch_device_fn.manual_seed_all + default_generators
+  5 use_gems_once       + with flag_gems.use_gems(): a trivial op, then kernel
+  6 all                 everything above in diagnose-tool order
 
-    python bisect_flag_gems_import_trigger.py --device 2
+Run:
+
     python bisect_flag_gems_import_trigger.py --device 2 --repeat 20
-
-It re-executes itself once per step in a subprocess (`--step N`) so that import
-side effects from a previous step cannot leak into the next.
 """
 
 from __future__ import annotations
@@ -29,25 +33,79 @@ import os
 import subprocess
 import sys
 
-# Ordered candidate imports. Each entry is (label, import statement). We import
-# them cumulatively (the i-th step execs statements[0..i]) because some require
-# predecessors (e.g. flag_gems.runtime before backends).
-STEPS = [
-    ("none", []),
-    ("triton", ["import triton"]),
-    ("torch_npu", ["import torch_npu"]),
-    ("flag_gems.runtime", ["import flag_gems.runtime"]),
-    ("flag_gems.testing", ["import flag_gems.testing"]),
-    ("flag_gems.backend", ["import flag_gems.runtime.backend"]),
-    ("flag_gems.ops", ["import flag_gems.ops"]),
-    ("flag_gems", ["import flag_gems"]),
+SETUPS = [
+    "triton_only",
+    "seed_cpu",
+    "seed_device",
+    "import_flag_gems",
+    "gems_device_seed",
+    "use_gems_once",
+    "all",
 ]
 
 
-def _run_kernel(repeat: int, n: int, block: int, scalar: float, dev: str) -> dict:
+def _setup(level: str) -> str:
+    """Apply a setup level; return the device string to use."""
+    import torch
+
+    dev = "npu" if hasattr(torch, "npu") else (
+        "cuda" if torch.cuda.is_available() else "cpu")
+
+    if level == "triton_only":
+        return dev
+
+    torch.manual_seed(0)
+    if level == "seed_cpu":
+        return dev
+
+    if level in ("seed_device", "import_flag_gems", "gems_device_seed",
+                 "use_gems_once", "all"):
+        msa = None
+        if dev == "npu" and hasattr(torch, "npu"):
+            msa = getattr(torch.npu, "manual_seed_all", None)
+        elif dev == "cuda":
+            msa = getattr(torch.cuda, "manual_seed_all", None)
+        if callable(msa):
+            msa(0)
+    if level == "seed_device":
+        return dev
+
+    import flag_gems  # noqa: F401
+    from flag_gems.runtime import torch_device_fn
+
+    dev = flag_gems.device
+    if level == "import_flag_gems":
+        return dev
+
+    msa = getattr(torch_device_fn, "manual_seed_all", None)
+    if callable(msa):
+        msa(0)
+    dg = getattr(torch_device_fn, "default_generators", None)
+    if dg is not None:
+        try:
+            for gen in dg:
+                gen.manual_seed(0)
+        except Exception:  # noqa: BLE001
+            pass
+    if level == "gems_device_seed":
+        return dev
+
+    if level in ("use_gems_once", "all"):
+        try:
+            x = torch.randn(8, dtype=torch.float32, device=dev)
+            with flag_gems.use_gems():
+                _ = torch.mul(x, 2.0)
+        except Exception:  # noqa: BLE001
+            pass
+    return dev
+
+
+def run_level(level: str, repeat: int, n: int, block: int, scalar: float) -> int:
     import torch
     import triton
     import triton.language as tl
+
+    dev = _setup(level)
 
     @triton.jit
     def mul_inplace(x_ptr, s, n, BLOCK: tl.constexpr):
@@ -69,20 +127,9 @@ def _run_kernel(repeat: int, n: int, block: int, scalar: float, dev: str) -> dic
         x = base.clone()
         mul_inplace[grid](x, scalar, n, BLOCK=block)
         hs.append(_hash(x))
-    return {"deterministic": len(set(hs)) == 1, "distinct": len(set(hs))}
-
-
-def run_step(step: int, repeat: int, n: int, block: int, scalar: float) -> int:
-    label, imports = STEPS[step]
-    for stmt in imports:
-        exec(stmt, {})  # noqa: S102 - intentional cumulative import
-    import torch
-
-    dev = "npu" if hasattr(torch, "npu") else (
-        "cuda" if torch.cuda.is_available() else "cpu")
-    res = _run_kernel(repeat, n, block, scalar, dev)
-    print(json.dumps({"step": step, "label": label,
-                      "imports": imports, **res}, default=str))
+    res = {"level": level, "dev": dev,
+           "deterministic": len(set(hs)) == 1, "distinct": len(set(hs))}
+    print(json.dumps(res, default=str))
     return 0 if res["deterministic"] else 1
 
 
@@ -90,42 +137,46 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", default=None)
-    ap.add_argument("--repeat", type=int, default=10)
+    ap.add_argument("--repeat", type=int, default=20)
     ap.add_argument("--n", type=int, default=1024 * 1024)
     ap.add_argument("--block", type=int, default=1024)
     ap.add_argument("--scalar", type=float, default=-0.999)
-    ap.add_argument("--step", type=int, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--level", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
-    if args.step is not None:
+    if args.level is not None:
         if args.device is not None:
             for var in ("ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"):
                 os.environ[var] = str(args.device)
-        return run_step(args.step, args.repeat, args.n, args.block, args.scalar)
+        return run_level(args.level, args.repeat, args.n, args.block, args.scalar)
 
-    print(f"{'step':>4} {'label':30s} {'deterministic':>13s}  distinct")
+    print(f"{'setup':20s} {'deterministic':>13s}  distinct  dev")
     trigger = None
-    for i, (label, _imports) in enumerate(STEPS):
+    for level in SETUPS:
         env = os.environ.copy()
         if args.device is not None:
             for var in ("ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"):
                 env[var] = str(args.device)
-        cmd = [sys.executable, __file__, "--step", str(i),
+        cmd = [sys.executable, __file__, "--level", level,
                "--repeat", str(args.repeat), "--n", str(args.n),
                "--block", str(args.block), "--scalar", str(args.scalar)]
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        last = proc.stdout.strip().splitlines()
-        info = json.loads(last[-1]) if last and last[-1].startswith("{") else \
-            {"deterministic": None, "distinct": "ERR"}
-        print(f"{i:>4} {label:30s} {str(info.get('deterministic')):>13s}  "
-              f"{info.get('distinct')}")
+        lines = proc.stdout.strip().splitlines()
+        info = json.loads(lines[-1]) if lines and lines[-1].startswith("{") \
+            else {"deterministic": None, "distinct": "ERR", "dev": "?"}
+        print(f"{level:20s} {str(info.get('deterministic')):>13s}  "
+              f"{info.get('distinct')}  {info.get('dev')}")
+        if not lines or not lines[-1].startswith("{"):
+            print("   stderr:", proc.stderr.strip().splitlines()[-1:] )
         if info.get("deterministic") is False and trigger is None:
-            trigger = label
-            print(f"     -> first nondeterministic import: {label}")
-    if trigger is None:
-        print("\nNo step reproduced nondeterminism; the trigger is not one of "
-              "these imports alone (may need torch.manual_seed/device seeding "
-              "as the diagnose tool does).")
+            trigger = level
+    print()
+    if trigger:
+        print(f"FIRST nondeterministic setup: {trigger}")
+        print("Compare with the previous row to see which setup call flips it.")
+    else:
+        print("No setup reproduced it; the trigger needs another factor "
+              "(e.g. a specific op compiled/run first, or a real gem op).")
     return 0
 
 
