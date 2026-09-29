@@ -141,6 +141,10 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=1024 * 1024)
     ap.add_argument("--block", type=int, default=1024)
     ap.add_argument("--scalar", type=float, default=-0.999)
+    ap.add_argument("--fresh-cache", action="store_true",
+                    help="give every setup its own TRITON_CACHE_DIR / "
+                         "FLAGGEMS_CACHE_DIR and set TRITON_ALWAYS_COMPILE=1, "
+                         "so a reused compiled binary cannot confound the result")
     ap.add_argument("--level", default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
@@ -150,6 +154,8 @@ def main() -> int:
                 os.environ[var] = str(args.device)
         return run_level(args.level, args.repeat, args.n, args.block, args.scalar)
 
+    import tempfile
+
     print(f"{'setup':20s} {'deterministic':>13s}  distinct  dev")
     trigger = None
     for level in SETUPS:
@@ -157,6 +163,11 @@ def main() -> int:
         if args.device is not None:
             for var in ("ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"):
                 env[var] = str(args.device)
+        if args.fresh_cache:
+            td = tempfile.mkdtemp(prefix=f"abdiag-{level}-")
+            env["TRITON_CACHE_DIR"] = os.path.join(td, "triton")
+            env["FLAGGEMS_CACHE_DIR"] = os.path.join(td, "fg")
+            env["TRITON_ALWAYS_COMPILE"] = "1"
         cmd = [sys.executable, __file__, "--level", level,
                "--repeat", str(args.repeat), "--n", str(args.n),
                "--block", str(args.block), "--scalar", str(args.scalar)]
