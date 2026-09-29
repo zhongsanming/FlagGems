@@ -18,12 +18,12 @@ argmax_kernel_2) return an intermittent wrong index.
 
 Scope / ownership
 -----------------
-This script uses ONLY torch + triton, no FlagGems; the kernels are plain
-``@triton.jit`` functions, so the nondeterminism is produced by the
-triton/flagtree -> AscendNPU-IR compilation+execution path. flagtree's linalg
-lowering of ``tt.reduce`` is deterministic in form; the wrong result appears
-after ``bishengir-compile`` (AscendNPU-IR), pointing at its reduction lowering
-(per-block reduction over the vector core / the index combiner).
+This script uses ONLY torch + triton; no FlagGems import is required. The
+nondeterminism appears only when the flagtree Ascend **auto-blockify** pass is
+enabled, so the script exports ``TRITON_ALL_BLOCKS_PARALLEL=1`` by default
+(``--no-all-blocks-parallel`` is the stable control). The defect is therefore in
+the triton/flagtree -> AscendNPU-IR pipeline under auto-blockify (its reduction
+lowering / scheduling), not in FlagGems.
 
 Controls in this script
 -----------------------
@@ -36,9 +36,9 @@ Controls in this script
 
 Run
 ---
-    python repro_reduce_return_indices_nondeterminism.py
-    python repro_reduce_return_indices_nondeterminism.py --repeat 20 --n 1048576
-    python repro_reduce_return_indices_nondeterminism.py --device 2
+    python repro_reduce_return_indices_nondeterminism.py --fresh-cache
+    python repro_reduce_return_indices_nondeterminism.py --device 2 --repeat 20 --fresh-cache
+    python repro_reduce_return_indices_nondeterminism.py --no-all-blocks-parallel --fresh-cache  # control
 
 Expected: reduce_max_where / reduce_max / reduce_sum deterministic; reduce_max_idx
 and reduce_argmax nondeterministic (multiple distinct hashes).
@@ -84,11 +84,17 @@ def main() -> int:
     ap.add_argument("--fresh-cache", action="store_true",
                     help="use a private TRITON_CACHE_DIR / FLAGGEMS_CACHE_DIR "
                          "and TRITON_ALWAYS_COMPILE=1 (fresh compile)")
+    ap.add_argument("--no-all-blocks-parallel", action="store_true",
+                    help="do not set TRITON_ALL_BLOCKS_PARALLEL (control)")
     args = ap.parse_args()
 
     if args.device is not None:
         for var in ("ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"):
             os.environ[var] = str(args.device)
+    if not args.no_all_blocks_parallel:
+        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
+    else:
+        os.environ.pop("TRITON_ALL_BLOCKS_PARALLEL", None)
     if args.fresh_cache:
         import tempfile
 
