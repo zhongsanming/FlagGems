@@ -78,6 +78,9 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=10)
     ap.add_argument("--device", default=None,
                     help="accelerator id to confine to (sets ASCEND_RT_VISIBLE_DEVICES)")
+    ap.add_argument("--import-flaggems", action="store_true",
+                    help="import flag_gems before running (the diagnose tool does; "
+                         "use to test whether the bug depends on flag_gems setup)")
     args = ap.parse_args()
 
     if args.device is not None:
@@ -89,6 +92,18 @@ def main() -> int:
     import torch
     import triton
     import triton.language as tl
+
+    dev = "npu" if hasattr(torch, "npu") else (
+        "cuda" if torch.cuda.is_available() else "cpu")
+    if args.import_flaggems:
+        import flag_gems  # noqa: F401
+        from flag_gems.runtime import torch_device_fn
+
+        try:
+            torch_device_fn.manual_seed_all(0)
+        except Exception:  # noqa: BLE001
+            pass
+        dev = flag_gems.device
 
     # ---- kernels -----------------------------------------------------------
     @triton.jit
@@ -140,7 +155,6 @@ def main() -> int:
             t.detach().to("cpu").contiguous().numpy().tobytes()
         ).hexdigest()[:16]
 
-    dev = "npu" if hasattr(torch, "npu") else ("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(0)
     base = torch.randn(args.n, dtype=torch.float32, device=dev)
     nblocks = triton.cdiv(args.n, args.block)
