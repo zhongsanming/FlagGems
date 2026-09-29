@@ -27,8 +27,13 @@ Run on the NPU host, e.g.:
     python tools/diagnose_ab_instability.py --op mul_ --repeat 10 --sync
     python tools/diagnose_ab_instability.py --triton-probe   # backend-only
     python tools/diagnose_ab_instability.py --env            # compiler fingerprint
+    python tools/diagnose_ab_instability.py --op mul_ --gpus 2 --repeat 10
 
 Respects FLAG_GEMS_SEED (like the A/B harness). Prints a JSON verdict.
+
+--gpus confines the process to one accelerator before any device init
+(vendor visibility env var, e.g. ASCEND_RT_VISIBLE_DEVICES), like the A/B
+runner, so a probe can be pinned to a specific card.
 
 Every report embeds an "env_fingerprint" (triton/flagtree/flag-gems versions
 plus the flagtree / AscendNPU-IR / flag_gems git revisions). Ascend results
@@ -167,6 +172,79 @@ def _env_fingerprint() -> dict:
         "TRITON_LANE_VECTORIZE_ALLOW_ADDRESS_CONES",
         "FLAGGEMS_CACHE_DIR", "TRITON_CACHE_DIR")}
     return fp
+
+
+# Same map as tools/run_ab_interleaved.py and run_tests.get_env().
+_VENDOR_DEVICE_VARS = {
+    "ascend": ["ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"],
+    "hygon": ["HIP_VISIBLE_DEVICES"],
+    "metax": ["MACA_VISIBLE_DEVICES"],
+    "mthreads": ["MUSA_VISIBLE_DEVICES"],
+    "tsingmicro": ["TXDA_VISIBLE_DEVICES"],
+    "iluvatar": ["ILUVATAR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"],
+    "thead": ["CUDA_VISIBLE_DEVICES"],
+    "cambricon": ["MLU_VISIBLE_DEVICES"],
+    "kunlunxin": ["CUDA_VISIBLE_DEVICES"],
+    "sunrise": ["TANG_VISIBLE_DEVICES"],
+    "enflame": ["TOPS_VISIBLE_DEVICES"],
+}
+
+
+def _resolve_gpus(spec: str) -> list[int]:
+    if spec.strip().lower() == "all":
+        try:
+            import torch
+
+            n = torch.accelerator.device_count()
+        except Exception:  # noqa: BLE001
+            n = 0
+        return list(range(n)) if n > 0 else [0]
+    return [int(x) for x in spec.split(",") if x.strip() != ""]
+
+
+def _detect_vendor() -> str | None:
+    """Best-effort vendor name from the installed torch accelerator backend.
+
+    Must not import flag_gems: its runtime probes the device on import, which
+    would happen before the visibility env var is set.
+    """
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        return None
+    for attr, vendor in (("npu", "ascend"), ("cuda", "nvidia"),
+                         ("musa", "mthreads"), ("gcu", "enflame"),
+                         ("mlu", "cambricon"), ("hip", "hygon")):
+        if hasattr(torch, attr):
+            return vendor
+    return None
+
+
+def _apply_gpus(spec: str) -> int:
+    """Confine this process to the first requested accelerator id.
+
+    Sets the vendor visibility env var (read by the runtime at device init)
+    BEFORE importing anything that could initialise the device. Returns 0 on
+    success.
+    """
+    ids = _resolve_gpus(spec)
+    if not ids:
+        print(f"--gpus {spec!r} resolved to no device ids", file=sys.stderr)
+        return 2
+    chosen = ids[0]
+    vendor = _detect_vendor()
+    vars_ = _VENDOR_DEVICE_VARS.get(vendor, ["CUDA_VISIBLE_DEVICES"])
+    for var in vars_:
+        os.environ[var] = str(chosen)
+    try:
+        import torch
+
+        torch.accelerator.set_device_index(0)
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"diagnose: using device id {chosen} (vendor={vendor}, "
+          f"{vars_[0]}={os.environ.get(vars_[0])})", file=sys.stderr)
+    return 0
 
 
 def _seed(seed: int) -> None:
@@ -360,7 +438,18 @@ def main(argv=None) -> int:
                     help="abort unless the runtime fingerprint matches. Pass a "
                          "JSON file/dict or comma key=val pairs, e.g. "
                          "triton_version=3.5.1,flagtree_git=0afb1367a")
+    ap.add_argument("--gpus", default=None,
+                    help='accelerator id(s) to use, e.g. "0" or "0,1", or '
+                         '"all". The single-device probes use the FIRST id and '
+                         'confine the process to it via the vendor visibility '
+                         'env var (e.g. ASCEND_RT_VISIBLE_DEVICES). Default: '
+                         'leave the environment unchanged.')
     args = ap.parse_args(argv)
+
+    if args.gpus is not None:
+        rc = _apply_gpus(args.gpus)
+        if rc != 0:
+            return rc
 
     if args.expect_env:
         rc = _check_expected_env(args.expect_env)
@@ -486,6 +575,10 @@ def _run_pair(label_a: str, label_b: str, args) -> int:
                 cmd += ["--sync"]
             if args.expect_env:
                 cmd += ["--expect-env", args.expect_env]
+            if args.gpus is not None:
+                chosen = _resolve_gpus(args.gpus)
+                if chosen:
+                    cmd += ["--gpus", str(chosen[0])]
             proc = subprocess.run(cmd, capture_output=True, text=True)
             results[tag] = _extract_json(proc.stdout) or {
                 "error": proc.stdout + proc.stderr}
