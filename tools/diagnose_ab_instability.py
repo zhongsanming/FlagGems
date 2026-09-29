@@ -773,6 +773,10 @@ def _triton_probe(args) -> int:
     Reports the positions (and position mod BLOCK) of the bad elements, to
     reveal a per-program boundary, and whether a sync or the absence of a
     preceding clone stabilises the kernel.
+
+    Also runs reduction variants (tl.max, tl.max(return_indices=True), tl.sum)
+    to check whether reductions themselves are nondeterministic, which is what
+    makes argmax's per-block argmax_kernel_1 flaky.
     """
     import hashlib
 
@@ -803,6 +807,32 @@ def _triton_probe(args) -> int:
         x = tl.load(x_ptr + offs, mask=m)
         tl.debug_barrier()
         tl.store(x_ptr + offs, x * s, mask=m)
+
+    @triton.jit
+    def _reduce_max(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m, other=float("-inf"))
+        tl.store(out_ptr + pid, tl.max(x, axis=0))
+
+    @triton.jit
+    def _reduce_max_idx(x_ptr, v_ptr, i_ptr, n, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m, other=float("-inf"))
+        v, i = tl.max(x, axis=0, return_indices=True)
+        tl.store(v_ptr + pid, v)
+        tl.store(i_ptr + pid, i)
+
+    @triton.jit
+    def _reduce_sum(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < n
+        x = tl.load(x_ptr + offs, mask=m, other=0.0)
+        tl.store(out_ptr + pid, tl.sum(x, axis=0))
 
     device = flag_gems.device
     n = 1024 * 1024
@@ -913,6 +943,40 @@ def _triton_probe(args) -> int:
         }
     print(json.dumps(report, indent=2, default=str))
 
+    # ---- reduction variants (argmax's kernel1 is a per-block tl.max) --------
+    def run_reduce(kernel, block, n_out):
+        def _f():
+            v = torch.empty(n_out, dtype=torch.float32, device=device)
+            i = torch.empty(n_out, dtype=torch.int64, device=device)
+            if kernel is _reduce_max_idx:
+                kernel[(n_out,)](base, v, i, n, BLOCK=block)
+                return torch.cat([v.view(torch.int32), i.to(torch.int32)])
+            kernel[(n_out,)](base, v, n, BLOCK=block)
+            return v
+        return _f
+
+    red = {
+        "reduce_max_b2048": run_reduce(_reduce_max, 2048,
+                                       triton.cdiv(n, 2048)),
+        "reduce_max_idx_b2048": run_reduce(_reduce_max_idx, 2048,
+                                           triton.cdiv(n, 2048)),
+        "reduce_sum_b2048": run_reduce(_reduce_sum, 2048,
+                                       triton.cdiv(n, 2048)),
+        "reduce_max_b1024": run_reduce(_reduce_max, 1024,
+                                       triton.cdiv(n, 1024)),
+    }
+    for name, fn in red.items():
+        try:
+            hs = [_hash(fn()) for _ in range(args.repeat)]
+        except Exception as exc:  # noqa: BLE001
+            report["runs"][name] = f"ERROR: {type(exc).__name__}: {exc}"
+            continue
+        report["runs"][name] = {
+            "hashes": hs, "deterministic": len(set(hs)) == 1,
+        }
+    print("\n=== with reductions ===")
+    print(json.dumps(report, indent=2, default=str))
+
     r = report["runs"]
 
     def det(name):
@@ -955,6 +1019,15 @@ def _triton_probe(args) -> int:
               file=sys.stderr)
     else:
         print("VERDICT: see per-variant results above.", file=sys.stderr)
+
+    flaky_red = [n for n in ("reduce_max_b2048", "reduce_max_idx_b2048",
+                             "reduce_sum_b2048", "reduce_max_b1024")
+                 if r.get(n) and not det(n)]
+    if flaky_red:
+        print("REDUCTION NONDETERMINISM: " + ", ".join(flaky_red)
+              + " -> tl.max/tl.sum over a block is nondeterministic on this"
+              " build (this is what makes argmax's per-block kernel flaky).",
+              file=sys.stderr)
     return 0
 
 
