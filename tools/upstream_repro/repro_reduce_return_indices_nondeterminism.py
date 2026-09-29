@@ -81,11 +81,21 @@ def main() -> int:
     ap.add_argument("--import-flaggems", action="store_true",
                     help="import flag_gems before running (the diagnose tool does; "
                          "use to test whether the bug depends on flag_gems setup)")
+    ap.add_argument("--fresh-cache", action="store_true",
+                    help="use a private TRITON_CACHE_DIR / FLAGGEMS_CACHE_DIR "
+                         "and TRITON_ALWAYS_COMPILE=1 (fresh compile)")
     args = ap.parse_args()
 
     if args.device is not None:
         for var in ("ASCEND_RT_VISIBLE_DEVICES", "NPU_VISIBLE_DEVICES"):
             os.environ[var] = str(args.device)
+    if args.fresh_cache:
+        import tempfile
+
+        td = tempfile.mkdtemp(prefix="repro-idx-")
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(td, "triton")
+        os.environ["FLAGGEMS_CACHE_DIR"] = os.path.join(td, "fg")
+        os.environ["TRITON_ALWAYS_COMPILE"] = "1"
 
     import json
 
