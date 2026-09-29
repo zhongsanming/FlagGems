@@ -14,6 +14,7 @@
 
 import logging
 import math
+import os
 
 import torch
 import triton
@@ -26,6 +27,20 @@ from flag_gems.utils import triton_lang_extension as ext
 from flag_gems.utils.limits import get_dtype_min
 
 logger = logging.getLogger(__name__)
+
+
+@libentry()
+@triton.jit
+def _avoid_index_reduce() -> bool:
+    """Whether to avoid tl.max(..., return_indices=True).
+
+    On Ascend (this AscendNPU-IR build) the reduce-with-index combiner is
+    nondeterministic, which makes the global argmax return a wrong index
+    intermittently. Plain tl.max / tl.min / tl.sum are deterministic, so when
+    FLAG_GEMS_AVOID_INDEX_REDUCE=1 we derive the index with max + min(where).
+    """
+    return os.environ.get("FLAG_GEMS_AVOID_INDEX_REDUCE", "0") not in (
+        "0", "", "false", "False")
 
 
 @libentry()
@@ -53,6 +68,40 @@ def argmax_kernel_1(
 
 @libentry()
 @triton.jit
+def argmax_kernel_1_safe(
+    inp,
+    mid_value,
+    mid_index,
+    M,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Deterministic replacement for argmax_kernel_1.
+
+    Avoids tl.max(return_indices=True): take the plain max, then the first
+    lane equal to it via tl.min over indices (ties -> smallest index, matching
+    torch). Only plain max/min are used, both of which are deterministic.
+    """
+    pid = ext.program_id(0)
+    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    inp_ptrs = inp + offset
+    mask = offset < M
+    min_value = get_dtype_min(inp.type.element_ty)
+    inp_val = tl.load(inp_ptrs, mask=mask, other=min_value)
+    max_val = tl.max(inp_val, axis=0)
+    # lanes equal to the block max; pick the smallest index (first occurrence).
+    lane = tl.arange(0, BLOCK_SIZE)
+    eq = inp_val == max_val
+    candidate = tl.where(eq, lane, BLOCK_SIZE)  # BLOCK_SIZE > any valid lane
+    max_index = tl.min(candidate, axis=0)
+    max_index = max_index + pid * BLOCK_SIZE
+    mid_value_ptr = mid_value + pid
+    max_index_ptr = mid_index + pid
+    tl.store(mid_value_ptr, max_val)
+    tl.store(max_index_ptr, max_index)
+
+
+@libentry()
+@triton.jit
 def argmax_kernel_2(mid_value, mid_index, out, mid_size, BLOCK_MID: tl.constexpr):
     offset = tl.arange(0, BLOCK_MID)
     mid_ptrs = mid_value + offset
@@ -60,6 +109,25 @@ def argmax_kernel_2(mid_value, mid_index, out, mid_size, BLOCK_MID: tl.constexpr
     min_value = get_dtype_min(mid_value.type.element_ty)
     mid_val = tl.load(mid_ptrs, mask=mask, other=min_value)
     index_val = tl.argmax(mid_val, axis=0)
+    mid_index_ptrs = mid_index + index_val
+    out_val = tl.load(mid_index_ptrs)
+    tl.store(out, out_val)
+
+
+@libentry()
+@triton.jit
+def argmax_kernel_2_safe(mid_value, mid_index, out, mid_size,
+                         BLOCK_MID: tl.constexpr):
+    """Deterministic replacement for argmax_kernel_2 (avoids tl.argmax)."""
+    offset = tl.arange(0, BLOCK_MID)
+    mid_ptrs = mid_value + offset
+    mask = offset < mid_size
+    min_value = get_dtype_min(mid_value.type.element_ty)
+    mid_val = tl.load(mid_ptrs, mask=mask, other=min_value)
+    block_max = tl.max(mid_val, axis=0)
+    eq = mid_val == block_max
+    candidate = tl.where(eq, offset, BLOCK_MID)
+    index_val = tl.min(candidate, axis=0)
     mid_index_ptrs = mid_index + index_val
     out_val = tl.load(mid_index_ptrs)
     tl.store(out, out_val)
@@ -121,14 +189,21 @@ def argmax(inp, dim=None, keepdim=False, *, dtype=None):
         out = torch.empty([], dtype=torch.int64, device=inp.device)
 
         with torch_device_fn.device(inp.device):
-            argmax_kernel_1[(mid_size, 1, 1)](
-                inp,
-                mid_value,
-                mid_index,
-                M,
-                block_size,
-            )
-            argmax_kernel_2[(1, 1, 1)](mid_value, mid_index, out, mid_size, block_mid)
+            if _avoid_index_reduce():
+                argmax_kernel_1_safe[(mid_size, 1, 1)](
+                    inp, mid_value, mid_index, M, block_size)
+                argmax_kernel_2_safe[(1, 1, 1)](
+                    mid_value, mid_index, out, mid_size, block_mid)
+            else:
+                argmax_kernel_1[(mid_size, 1, 1)](
+                    inp,
+                    mid_value,
+                    mid_index,
+                    M,
+                    block_size,
+                )
+                argmax_kernel_2[(1, 1, 1)](
+                    mid_value, mid_index, out, mid_size, block_mid)
         return out
     else:
         assert dim >= -inp.ndim and dim < inp.ndim, "Invalid dim"
