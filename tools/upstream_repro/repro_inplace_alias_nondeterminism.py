@@ -98,13 +98,30 @@ def main() -> int:
     dev = "npu" if hasattr(torch, "npu") else (
         "cuda" if torch.cuda.is_available() else "cpu")
     if args.import_flaggems:
-        import flag_gems  # noqa: F401
+        # Mirror the diagnose tool / FlagGems harness setup exactly.
+        import random
+
+        import flag_gems
         from flag_gems.runtime import torch_device_fn
 
+        random.seed(0)
         try:
-            torch_device_fn.manual_seed_all(0)
-        except Exception:  # noqa: BLE001
+            import numpy as np
+
+            np.random.seed(0)
+        except ImportError:
             pass
+        torch.manual_seed(0)
+        msa = getattr(torch_device_fn, "manual_seed_all", None)
+        if callable(msa):
+            msa(0)
+        dg = getattr(torch_device_fn, "default_generators", None)
+        if dg is not None:
+            try:
+                for gen in dg:
+                    gen.manual_seed(0)
+            except Exception:  # noqa: BLE001
+                pass
         dev = flag_gems.device
 
     # ---- kernels -----------------------------------------------------------
