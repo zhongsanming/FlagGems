@@ -29,8 +29,6 @@ from flag_gems.utils.limits import get_dtype_min
 logger = logging.getLogger(__name__)
 
 
-@libentry()
-@triton.jit
 def _avoid_index_reduce() -> bool:
     """Whether to avoid tl.max(..., return_indices=True).
 
