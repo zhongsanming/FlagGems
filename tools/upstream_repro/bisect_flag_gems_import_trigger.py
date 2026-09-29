@@ -37,10 +37,18 @@ SETUPS = [
     "triton_only",
     "seed_cpu",
     "seed_device",
+    "all_blocks_parallel",
     "import_flag_gems",
     "gems_device_seed",
     "use_gems_once",
     "all",
+]
+
+
+# Env vars that flag_gems sets at import time (module-level), which leak into
+# every later kernel compiled in the process. Listed for bisection.
+LEAKED_ENV_VARS = [
+    "TRITON_ALL_BLOCKS_PARALLEL",
 ]
 
 
@@ -56,6 +64,11 @@ def _setup(level: str) -> str:
 
     torch.manual_seed(0)
     if level == "seed_cpu":
+        return dev
+
+    if level == "all_blocks_parallel":
+        # Reproduce the single global flag that flag_gems sets at import.
+        os.environ["TRITON_ALL_BLOCKS_PARALLEL"] = "1"
         return dev
 
     if level in ("seed_device", "import_flag_gems", "gems_device_seed",
