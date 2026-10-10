@@ -66,10 +66,13 @@ def main() -> int:
         bad_b += a != ref; bad_i += b != ref
         got_b.add(a)
     print(f"B={B} ref_count={ref} repeat={args.repeat}")
-    print(f"  tl.sum(bool)          : wrong = {bad_b}/{args.repeat}  values={sorted(got_b)[:5]}")
+    print(f"  tl.sum(bool)          : wrong = {bad_b}/{args.repeat}  "
+          f"returned values={sorted(got_b)[:5]}")
     print(f"  tl.sum(bool.to(i32))  : wrong = {bad_i}/{args.repeat}")
     if bad_b and not bad_i:
-        print("REPRODUCED: bool reduction is wrong; int32 cast ok.")
+        mode = "ALWAYS returns 1" if got_b == {1} else \
+               f"returns wrong value(s) {sorted(got_b)[:5]}"
+        print(f"REPRODUCED: bool reduction is wrong ({mode}); int32 cast ok.")
         return 0
     if not bad_b:
         print("Not reproduced (this toolchain may already fix it).")

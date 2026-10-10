@@ -56,38 +56,69 @@ def main() -> int:
         v = tl.load(data_ptr + other * B + ar)
         tl.store(out_ptr + pid * B + ar, v)
 
+    @triton.jit
+    def write_rows(data_ptr, P, B: tl.constexpr):
+        pid = tl.program_id(0)
+        ar = tl.arange(0, B)
+        tl.store(data_ptr + pid * B + ar,
+                 tl.full((B,), 1.0, tl.float32) * (pid + 1))
+
+    @triton.jit
+    def read_prev(data_ptr, out_ptr, P, B: tl.constexpr):
+        pid = tl.program_id(0)
+        ar = tl.arange(0, B)
+        other = (pid - 1) % P
+        v = tl.load(data_ptr + other * B + ar)
+        tl.store(out_ptr + pid * B + ar, v)
+
+    def _exp(P):
+        return torch.tensor([((p - 1) % P) + 1 for p in range(P)],
+                            dtype=torch.float32).unsqueeze(1).expand(P, B)
+
     def run_spin(P):
-        data = torch.zeros(P * B, dtype=torch.float32, device="npu")
-        flag = torch.zeros(1, dtype=torch.int32, device="npu")
-        out = torch.empty(P * B, dtype=torch.float32, device="npu")
+        data = torch.zeros(P * B, dtype=torch.float32, device=dev)
+        flag = torch.zeros(1, dtype=torch.int32, device=dev)
+        out = torch.empty(P * B, dtype=torch.float32, device=dev)
         spin_barrier[(P,)](data, flag, out, P, B=B)
         o = out.detach().to("cpu").reshape(P, B)
-        exp = torch.tensor([((p - 1) % P) + 1 for p in range(P)],
-                           dtype=torch.float32).unsqueeze(1).expand(P, B)
-        bad = int((o != exp).sum().item())
-        return bad, P * B
+        n_zero = int((o == 0).sum().item())
+        bad = int((o != _exp(P)).sum().item())
+        return bad, P * B, n_zero
+
+    def run_two_kernel(P):
+        data = torch.zeros(P * B, dtype=torch.float32, device=dev)
+        out = torch.empty(P * B, dtype=torch.float32, device=dev)
+        write_rows[(P,)](data, P, B=B)
+        read_prev[(P,)](data, out, P, B=B)      # kernel boundary orders it
+        o = out.detach().to("cpu").reshape(P, B)
+        bad = int((o != _exp(P)).sum().item())
+        return bad, P * B, int((o == 0).sum().item())
 
     dev = "npu" if hasattr(torch, "npu") else "cuda"
     counts = [int(x) for x in args.counts.split(",")]
     print(f"B={B} counts={counts} repeat={args.repeat}")
     reproduced = False
     for P in counts:
-        bad_total = 0
+        bad_total = zero_total = 0
         err = None
         for _ in range(args.repeat):
             try:
-                b, tot = run_spin(P)
+                b, tot, nz = run_spin(P)
                 bad_total = max(bad_total, b)
+                zero_total = max(zero_total, nz)
             except Exception as e:  # noqa: BLE001
                 err = f"{type(e).__name__}: {str(e)[:100]}"
                 break
         if err:
-            print(f"  P={P:3d}: exception {err}")
+            print(f"  spin  P={P:3d}: exception {err}")
         else:
-            print(f"  P={P:3d}: worst stale/garbage elements = {bad_total} "
-                  f"/ {P*B}")
+            print(f"  spin  P={P:3d}: worst wrong = {bad_total}/{P*B} "
+                  f"(stale-zero elems={zero_total})")
             if P >= 8 and bad_total > 0:
                 reproduced = True
+        # control: two kernels (kernel boundary orders the write before the read)
+        cb, _, _ = run_two_kernel(P)
+        print(f"  2krn  P={P:3d}: wrong = {cb}/{P*B}")
     if reproduced:
         print("REPRODUCED: cross-program spin barrier does not guarantee "
               "visibility for >=8 programs.")
