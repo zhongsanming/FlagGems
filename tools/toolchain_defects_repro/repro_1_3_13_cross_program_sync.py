@@ -45,14 +45,15 @@ def main() -> int:
     def spin_barrier(data_ptr, flag_ptr, out_ptr, P, B: tl.constexpr):
         pid = tl.program_id(0)
         ar = tl.arange(0, B)
-        # pass 1: every program writes its own row = pid, then bumps the flag
+        # pass 1: every program writes its own row = pid+1, then bumps the flag
         tl.store(data_ptr + pid * B + ar, tl.full((B,), 1.0, tl.float32) * (pid + 1))
         tl.atomic_add(flag_ptr, 1)
         # spin until all P programs arrived
         while tl.load(flag_ptr, volatile=True) < P:
             pass
-        # read the previous program's row (wrap); must be visible
-        other = (pid - 1) % P
+        # read the previous program's row (wrap). NOTE: Triton signed % is srem
+        # (truncated), so (0-1) % P == -1; wrap explicitly with where.
+        other = tl.where(pid == 0, P - 1, pid - 1)
         v = tl.load(data_ptr + other * B + ar)
         tl.store(out_ptr + pid * B + ar, v)
 
@@ -67,7 +68,7 @@ def main() -> int:
     def read_prev(data_ptr, out_ptr, P, B: tl.constexpr):
         pid = tl.program_id(0)
         ar = tl.arange(0, B)
-        other = (pid - 1) % P
+        other = tl.where(pid == 0, P - 1, pid - 1)
         v = tl.load(data_ptr + other * B + ar)
         tl.store(out_ptr + pid * B + ar, v)
 
